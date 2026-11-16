@@ -31,5 +31,5 @@ scripts/cmake.sh
 .idea/
 compile_commands.json
 
-# --- requirement use-case document is intentionally NOT committed ---
-即时通迅软件需求用例.txt
+# --- local-only docs / scratch (requirement spec lives here) ---
+.tmp/
