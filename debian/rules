@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+# deepin-MeshLink — Debian packaging rules
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 HuanSoft Open Source Community <https://huansoft.org.cn>
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@ --buildsystem=cmake
+
+# Self-tests are not run in the package build: the integration harness needs
+# multiple processes, fixed loopback ports and a live network namespace.
+override_dh_auto_configure:
+	dh_auto_configure --buildsystem=cmake -- \
+		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DMESHLINK_BUILD_TESTS=OFF
+
+override_dh_auto_test:
+	@echo "deepin-MeshLink: self-tests are run manually (see README.md), skipping in package build."

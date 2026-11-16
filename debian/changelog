@@ -1,0 +1,17 @@
+deepin-meshlink (1.0.0) unstable; urgency=medium
+
+  * Initial release of the deepin-MeshLink MVP.
+  * UC-01/02: local Ed25519 account with 32-hex fingerprint, AES-256-GCM
+    encrypted keystore, profile editing and full account destruction.
+  * UC-03/04: signed UDP heartbeats, LAN peer discovery, offline pruning,
+    farewell packets and spoofed-heartbeat reporting.
+  * UC-05/06/07: hosted rooms, open/approval join policies, capacity limits,
+    host-admin-member moderation matrix, mute, kick and blacklist.
+  * UC-08: TLS 1.3 relayed text and image messages with authoritative
+    sequence numbers; image bytes fetched on demand by content hash.
+  * UC-09/10/11/12: file announcements, supplier registry, explicit
+    request-only chunked downloads, persisted per-chunk resume, parallel
+    workers and SHA-256 verification with targeted retransmission.
+  * UC-13: leave room and host dissolve notifications.
+
+ -- HuanSoft Open Source Community <yxzl666xx@outlook.com>  Mon, 16 Nov 2026 22:20:00 +0800
