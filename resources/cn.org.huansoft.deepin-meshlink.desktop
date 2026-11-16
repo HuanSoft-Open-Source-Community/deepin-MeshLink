@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=深度织讯
+Name[zh_CN]=深度织讯
+Name[en]=deepin-MeshLink
+GenericName=LAN Messenger
+GenericName[zh_CN]=局域网即时通讯
+Comment=去中心化局域网即时通讯：每个节点即服务器
+Comment[en]=Decentralised LAN instant messaging; every node is a server
+Exec=deepin-meshlink %U
+TryExec=deepin-meshlink
+Icon=cn.org.huansoft.deepin-meshlink
+Terminal=false
+Categories=Network;InstantMessaging;
+StartupWMClass=deepin-meshlink
+X-DDAIdHint=cn.org.huansoft.deepin-meshlink
