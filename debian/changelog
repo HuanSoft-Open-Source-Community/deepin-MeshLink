@@ -1,3 +1,18 @@
+deepin-meshlink (26.4.0.0~alpha1) unstable; urgency=medium
+
+  * Version scheme switched to <yy>.<quarter>.<x>.<y>; 26.4.0.0 is the first
+    alpha of 2026 Q4.
+  * Network: select the LAN segment in the first-start wizard, switch it live
+    from Settings; heartbeats are broadcast into and accepted only from the
+    selected IPv4 segment (manual bootstrap peers remain honoured).
+  * Rooms: 32-hex room fingerprint ids plus a unique six-digit numeric invite
+    code; join by invite code from the Discover page (LAN-local lookup).
+  * Storage: forward migration rekeys legacy 16-hex room ids to 32-hex and
+    backfills invite codes, cascading to members/messages/announcements.
+  * Protocol: bump to v2 (heartbeat format + room snapshot invite code).
+
+ -- HuanSoft Open Source Community <yxzl666xx@outlook.com>  Mon, 16 Nov 2026 23:05:00 +0800
+
 deepin-meshlink (1.0.0) unstable; urgency=medium
 
   * Initial release of the deepin-MeshLink MVP.
