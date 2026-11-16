@@ -24,6 +24,32 @@ RoomManager::RoomManager(AccountManager *acct, Storage *storage, Settings *setti
     : QObject(parent), m_acct(acct), m_storage(storage), m_settings(settings), m_link(link) {}
 
 // ---------------- helpers ----------------
+namespace {
+QString generateInviteCode(Storage *storage) {
+    for (int attempt = 0; attempt < 128; ++attempt) {
+        const Bytes bytes = Crypto::randomBytes(4);
+        const quint32 value = (quint32(bytes[0]) << 24) | (quint32(bytes[1]) << 16) | (quint32(bytes[2]) << 8) |
+                              quint32(bytes[3]);
+        const QString code = QStringLiteral("%1").arg(value % 1000000u, kInviteCodeDigits, 10, QChar('0'));
+        QSqlQuery q = storage->query("SELECT 1 FROM rooms WHERE invite_code=?");
+        q.bindValue(0, code);
+        q.exec();
+        if (!q.next())
+            return code;
+    }
+    return {};
+}
+} // namespace
+
+bool RoomManager::isValidInviteCode(const QString &code) {
+    if (code.size() != kInviteCodeDigits)
+        return false;
+    for (const QChar c : code)
+        if (!c.isDigit())
+            return false;
+    return true;
+}
+
 QString RoomManager::createRoom(const QString &name, const QString &intro, JoinPolicy policy, int capacity,
                                 QString *error) {
     const QString n = name.trimmed();
@@ -36,19 +62,28 @@ QString RoomManager::createRoom(const QString &name, const QString &intro, JoinP
         capacity = 0;
     const qint64 ts = nowMs();
     const QString self = m_acct->profile().fingerprint;
-    const QByteArray seed = (self + n + QString::number(ts)).toUtf8();
+    const QString inviteCode = generateInviteCode(m_storage);
+    if (inviteCode.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("无法生成唯一邀请码，请稍后重试");
+        return {};
+    }
+    const QByteArray seed = (self + "|" + n + "|" + inviteCode + "|" + QString::number(ts)).toUtf8();
     const QString roomId = QString::fromLatin1(
-        Crypto::sha256Hex(reinterpret_cast<const uint8_t *>(seed.constData()), size_t(seed.size())).substr(0, 16).c_str());
+        Crypto::sha256Hex(reinterpret_cast<const uint8_t *>(seed.constData()), size_t(seed.size()))
+            .substr(0, kRoomIdHexLen)
+            .c_str());
 
-    QSqlQuery q = m_storage->query("INSERT INTO rooms (room_id,name,intro,policy,global_mute,capacity,host_fp,hosted,joined,created_ts)"
-                                   " VALUES (?,?,?, ?,0,?,?,1,1,?)");
+    QSqlQuery q = m_storage->query("INSERT INTO rooms (room_id,name,intro,invite_code,policy,global_mute,capacity,host_fp,hosted,joined,created_ts)"
+                                   " VALUES (?,?,?,?,?,0,?,?,1,1,?)");
     q.bindValue(0, roomId);
     q.bindValue(1, n);
     q.bindValue(2, intro.trimmed());
-    q.bindValue(3, static_cast<int>(policy));
-    q.bindValue(4, capacity);
-    q.bindValue(5, self);
-    q.bindValue(6, ts);
+    q.bindValue(3, inviteCode);
+    q.bindValue(4, static_cast<int>(policy));
+    q.bindValue(5, capacity);
+    q.bindValue(6, self);
+    q.bindValue(7, ts);
     if (!q.exec()) {
         if (error)
             *error = q.lastError().text();
@@ -73,7 +108,7 @@ void RoomManager::upsertMember(const QString &roomId, const QString &fp, const Q
 QVector<RoomLocal> RoomManager::myRooms() const {
     QVector<RoomLocal> out;
     QSqlQuery q = m_storage->query(
-        "SELECT r.room_id,r.name,r.intro,r.policy,r.global_mute,r.capacity,r.host_fp,r.hosted,r.joined,r.created_ts,"
+        "SELECT r.room_id,r.name,r.intro,r.invite_code,r.policy,r.global_mute,r.capacity,r.host_fp,r.hosted,r.joined,r.created_ts,"
         " (SELECT COUNT(*) FROM members m WHERE m.room_id=r.room_id),"
         " (SELECT m.nickname FROM members m WHERE m.room_id=r.room_id AND m.fingerprint=r.host_fp)"
         " FROM rooms r WHERE r.joined=1 OR r.hosted=1 ORDER BY r.created_ts");
@@ -83,15 +118,16 @@ QVector<RoomLocal> RoomManager::myRooms() const {
         r.roomId = q.value(0).toString();
         r.name = q.value(1).toString();
         r.intro = q.value(2).toString();
-        r.policy = static_cast<JoinPolicy>(q.value(3).toInt());
-        r.globalMute = q.value(4).toInt() != 0;
-        r.capacity = q.value(5).toInt();
-        r.hostFp = q.value(6).toString();
-        r.hosted = q.value(7).toInt() != 0;
-        r.joined = q.value(8).toInt() != 0;
-        r.createdTs = q.value(9).toLongLong();
-        r.memberCount = q.value(10).toInt();
-        r.hostNickname = q.value(11).toString();
+        r.inviteCode = q.value(3).toString();
+        r.policy = static_cast<JoinPolicy>(q.value(4).toInt());
+        r.globalMute = q.value(5).toInt() != 0;
+        r.capacity = q.value(6).toInt();
+        r.hostFp = q.value(7).toString();
+        r.hosted = q.value(8).toInt() != 0;
+        r.joined = q.value(9).toInt() != 0;
+        r.createdTs = q.value(10).toLongLong();
+        r.memberCount = q.value(11).toInt();
+        r.hostNickname = q.value(12).toString();
         r.hostIsOnline = m_resolve ? m_resolve(r.hostFp).has_value() : r.hosted;
         out.append(r);
     }
@@ -199,15 +235,16 @@ QVector<QString> RoomManager::blacklist(const QString &roomId) const {
 
 QVector<RoomSummary> RoomManager::hostedSummaries() const {
     QVector<RoomSummary> out;
-    QSqlQuery q = m_storage->query("SELECT r.room_id,r.name,r.policy,(SELECT COUNT(*) FROM members m WHERE m.room_id=r.room_id)"
+    QSqlQuery q = m_storage->query("SELECT r.room_id,r.name,r.invite_code,r.policy,(SELECT COUNT(*) FROM members m WHERE m.room_id=r.room_id)"
                                    " FROM rooms r WHERE r.hosted=1");
     q.exec();
     while (q.next()) {
         RoomSummary s;
         s.roomId = q.value(0).toString();
         s.name = q.value(1).toString();
-        s.policy = static_cast<JoinPolicy>(q.value(2).toInt());
-        s.members = q.value(3).toInt();
+        s.inviteCode = q.value(2).toString();
+        s.policy = static_cast<JoinPolicy>(q.value(3).toInt());
+        s.members = q.value(4).toInt();
         s.hostFp = m_acct->profile().fingerprint;
         out.append(s);
     }
@@ -399,6 +436,7 @@ void RoomManager::sendSnapshotTo(const QString &fp, const QString &roomId) {
     snap.roomId = r.roomId;
     snap.name = r.name;
     snap.intro = r.intro;
+    snap.inviteCode = r.inviteCode;
     snap.policy = static_cast<quint8>(r.policy);
     snap.globalMute = r.globalMute;
     snap.capacity = r.capacity;
@@ -483,18 +521,20 @@ void RoomManager::handleSnapshot(SecureChannel *ch, const QByteArray &payload) {
         return;
     }
     m_pendingJoinHost.remove(snap.roomId); // join handshake completed
-    QSqlQuery rq = m_storage->query("INSERT INTO rooms (room_id,name,intro,policy,global_mute,capacity,host_fp,hosted,joined,created_ts)"
-                                    " VALUES (?,?,?,?,?,?,?,0,1,?) ON CONFLICT(room_id) DO UPDATE SET"
-                                    " name=excluded.name,intro=excluded.intro,policy=excluded.policy,"
-                                    " global_mute=excluded.global_mute,capacity=excluded.capacity,joined=1");
+    QSqlQuery rq = m_storage->query("INSERT INTO rooms (room_id,name,intro,invite_code,policy,global_mute,capacity,host_fp,hosted,joined,created_ts)"
+                                    " VALUES (?,?,?,?,?,?,?,?,0,1,?) ON CONFLICT(room_id) DO UPDATE SET"
+                                    " name=excluded.name,intro=excluded.intro,invite_code=excluded.invite_code,"
+                                    " policy=excluded.policy,global_mute=excluded.global_mute,"
+                                    " capacity=excluded.capacity,joined=1");
     rq.bindValue(0, snap.roomId);
     rq.bindValue(1, snap.name);
     rq.bindValue(2, snap.intro);
-    rq.bindValue(3, int(snap.policy));
-    rq.bindValue(4, snap.globalMute ? 1 : 0);
-    rq.bindValue(5, snap.capacity);
-    rq.bindValue(6, ch ? ch->peerFingerprint() : QString());
-    rq.bindValue(7, nowMs());
+    rq.bindValue(3, snap.inviteCode);
+    rq.bindValue(4, int(snap.policy));
+    rq.bindValue(5, snap.globalMute ? 1 : 0);
+    rq.bindValue(6, snap.capacity);
+    rq.bindValue(7, ch ? ch->peerFingerprint() : QString());
+    rq.bindValue(8, nowMs());
     rq.exec();
 
     // Replace member roster (authoritative snapshot, BR-12)

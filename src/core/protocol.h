@@ -122,7 +122,7 @@ struct Msg {
 };
 
 struct RoomSnapshotMsg {
-    QString roomId, name, intro;
+    QString roomId, name, intro, inviteCode;
     quint8 policy = 0;
     bool globalMute = false;
     int capacity = 0, memberCount = 0;

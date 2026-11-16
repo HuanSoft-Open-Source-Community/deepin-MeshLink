@@ -112,11 +112,12 @@ ChatView::ChatView(Engine *engine, QWidget *parent) : QWidget(parent), m_engine(
         if (roomId == m_roomId) {
             const auto ms = m_engine->rooms()->members(roomId);
             const RoomLocal r = m_engine->rooms()->room(roomId);
-            m_header->setText(QStringLiteral("%1 · %2 人 · %3%4")
+            m_header->setText(QStringLiteral("%1 · %2 人 · %3%4 · 邀请码 %5")
                                   .arg(r.name)
                                   .arg(ms.size())
                                   .arg(r.hosted ? QStringLiteral("我托管") : QStringLiteral("托管者在线"))
-                                  .arg(r.policy == JoinPolicy::Approval ? QStringLiteral(" · 需批准") : QString()));
+                                  .arg(r.policy == JoinPolicy::Approval ? QStringLiteral(" · 需批准") : QString())
+                                  .arg(r.inviteCode));
             refreshMuteState();
         }
     });
@@ -146,10 +147,11 @@ void ChatView::setRoom(const QString &roomId) {
     m_input->setEnabled(true);
     m_sendBtn->setEnabled(true);
     const RoomLocal r = m_engine->rooms()->room(roomId);
-    m_header->setText(QStringLiteral("%1 · %2%3")
+    m_header->setText(QStringLiteral("%1 · %2%3 · 邀请码 %4")
                           .arg(r.name,
                                r.hosted ? QStringLiteral("（我托管）") : QStringLiteral("（成员）"),
-                               r.policy == JoinPolicy::Approval ? QStringLiteral(" · 需批准加入") : QString()));
+                               r.policy == JoinPolicy::Approval ? QStringLiteral(" · 需批准加入") : QString())
+                          .arg(r.inviteCode));
     renderHistory();
     refreshMuteState();
 }

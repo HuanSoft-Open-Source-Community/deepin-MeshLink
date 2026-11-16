@@ -15,6 +15,7 @@
 #include "core/downloader.h"
 #include "core/engine.h"
 #include "core/filemanager.h"
+#include "core/lansegment.h"
 #include "core/roommanager.h"
 #include "core/settings.h"
 
@@ -178,35 +179,58 @@ static void handleLine(NodeCtl *n, const QString &line) {
         const JoinPolicy p = a.value(2) == "approval" ? JoinPolicy::Approval : JoinPolicy::Open;
         QString err;
         const QString id = e->rooms()->createRoom(a.value(1), QStringLiteral("测试简介"), p, a.value(3).toInt(), &err);
-        if (id.isEmpty())
+        if (id.isEmpty()) {
             ev("err", {{"why", err}});
-        else
-            ev("room", {{"id", id}, {"name", a.value(1)}, {"policy", int(p)}});
+        } else {
+            const RoomLocal created = e->rooms()->room(id);
+            ev("room", {{"id", id}, {"code", created.inviteCode}, {"name", a.value(1)}, {"policy", int(p)}});
+        }
     } else if (cmd == "rooms") {
         QJsonArray arr;
         for (const auto &p : e->discovery()->peers())
             for (const auto &r : p.hostedRooms)
-                arr.append(QJsonObject{{"id", r.roomId}, {"name", r.name}, {"policy", int(r.policy)}, {"host", r.hostFp.left(8)}});
+                arr.append(QJsonObject{{"id", r.roomId}, {"code", r.inviteCode}, {"name", r.name},
+                                       {"policy", int(r.policy)}, {"host", r.hostFp.left(8)}});
         for (const auto &r : e->rooms()->hostedSummaries())
-            arr.append(QJsonObject{{"id", r.roomId}, {"name", r.name}, {"policy", int(r.policy)}, {"host", self.left(8)}, {"mine", true}});
+            arr.append(QJsonObject{{"id", r.roomId}, {"code", r.inviteCode}, {"name", r.name},
+                                   {"policy", int(r.policy)}, {"host", self.left(8)}, {"mine", true}});
         ev("rooms", {{"list", arr}});
-    } else if (cmd == "join") { // join <roomid>
-        RoomSummary s;
-        for (const auto &p : e->discovery()->peers()) {
-            for (const auto &r : p.hostedRooms)
-                if (r.roomId == a.value(1))
-                    s = r;
-        }
-        if (s.roomId.isEmpty()) {
-            fprintf(stderr, "[node-cmd] join %s NOT-IN-LIST yet\n", qUtf8Printable(a.value(1).left(8)));
-            ev("joincb", {{"room", a.value(1)}, {"status", int(JoinStatus::RoomGone)}, {"detail", "not-in-list"}});
+    } else if (cmd == "join") { // join <roomid|invitecode>
+        const QString key = a.value(1);
+        std::optional<RoomSummary> found = RoomManager::isValidInviteCode(key)
+                                               ? e->discovery()->roomByInviteCode(key)
+                                               : e->discovery()->roomById(key);
+        if (!found) {
+            fprintf(stderr, "[node-cmd] join %s NOT-IN-LIST yet\n", qUtf8Printable(key.left(8)));
+            ev("joincb", {{"room", key}, {"status", int(JoinStatus::RoomGone)}, {"detail", "not-in-list"}});
             return;
         }
-        fprintf(stderr, "[node-cmd] join %s host=%s\n", qUtf8Printable(a.value(1).left(8)), qUtf8Printable(s.hostFp.left(8)));
+        const RoomSummary s = *found;
+        fprintf(stderr, "[node-cmd] join %s host=%s\n", qUtf8Printable(s.roomId.left(8)),
+                qUtf8Printable(s.hostFp.left(8)));
         e->rooms()->joinRoom(s, [](JoinStatus st, const QString &detail) {
             fprintf(stderr, "[node-cmd] joincb st=%d why=%s\n", int(st), qUtf8Printable(detail));
             ev("joincb", {{"status", int(st)}, {"detail", detail}});
         });
+    } else if (cmd == "segment") {
+        const LanSegment seg = e->lanSegment();
+        ev("segment", {{"ip", seg.ip},
+                       {"prefix", seg.prefixLength},
+                       {"broadcast", seg.broadcastAddress().toString()},
+                       {"label", seg.label()}});
+    } else if (cmd == "switchseg") { // switchseg <ip> <prefix>
+        LanSegment seg;
+        seg.interfaceName = QStringLiteral("test");
+        seg.ip = a.value(1);
+        seg.prefixLength = a.value(2).toInt();
+        QString err;
+        const bool ok = e->setLanSegment(seg, &err);
+        ev("segswitched", {{"ok", ok}, {"err", err}, {"label", e->lanSegmentLabel()}});
+    } else if (cmd == "peers") {
+        QJsonArray fps;
+        for (const auto &p : e->discovery()->peers())
+            fps.append(p.fingerprint.left(8));
+        ev("peers", {{"count", int(fps.size())}, {"fps", fps}});
     } else if (cmd == "members") {
         QJsonArray arr;
         for (const auto &m : e->rooms()->members(a.value(1)))
@@ -485,8 +509,17 @@ static int parentMain(QCoreApplication &app) {
         selfPath = QDir::current().absoluteFilePath(selfPath);
 
     // shared LAN bootstrap UDP port for all nodes
-    const QString udpPort = QStringLiteral("24651");
-    const QString bootstrap = QStringLiteral("127.0.0.1:%1").arg(udpPort);
+    // Each node owns a distinct UDP discovery port and unicasts heartbeats to
+    // every peer (the sandbox cannot rely on a shared broadcast port because
+    // SO_REUSEADDR delivers unicast to a single socket). The selected LAN
+    // segment is still the loopback subnet, so source-address filtering is
+    // exercised end to end and S10 can flip it at runtime.
+    const QStringList udpPorts = {QStringLiteral("24651"), QStringLiteral("24652"), QStringLiteral("24653"),
+                                  QStringLiteral("24654")};
+    QStringList bootstrapParts;
+    for (const auto &p : udpPorts)
+        bootstrapParts << QStringLiteral("127.0.0.1:%1").arg(p);
+    const QString bootstrap = bootstrapParts.join(',');
 
     // sample payloads
     const QString file1 = root + "/file1.bin";
@@ -503,7 +536,7 @@ static int parentMain(QCoreApplication &app) {
     }
     const QString h1s = QString::fromLatin1(h1), h2s = QString::fromLatin1(h2), h3s = QString::fromLatin1(h3);
 
-    auto nodeEnv = [&](const QString &name, const QString &tcpPort, bool evil) {
+    auto nodeEnv = [&](const QString &name, const QString &tcpPort, const QString &udpPort, bool evil) {
         QStringList e;
         e << QStringLiteral("MESHLINK_NODE=%1").arg(name)
           << QStringLiteral("MESHLINK_DATA_HOME=%1/%2").arg(root, name)
@@ -524,10 +557,10 @@ static int parentMain(QCoreApplication &app) {
 
     Node alice{"alice", {}, {}, {}, {}}, bob{"bob", {}, {}, {}, {}}, carol{"carol", {}, {}, {}, {}},
          mallory{"mallory", {}, {}, {}, {}};
-    alice.start(selfPath, nodeEnv("alice", "24701", false));
-    bob.start(selfPath, nodeEnv("bob", "24702", false));
-    carol.start(selfPath, nodeEnv("carol", "24703", false));
-    mallory.start(selfPath, nodeEnv("mallory", "24704", true));
+    alice.start(selfPath, nodeEnv("alice", "24701", udpPorts[0], false));
+    bob.start(selfPath, nodeEnv("bob", "24702", udpPorts[1], false));
+    carol.start(selfPath, nodeEnv("carol", "24703", udpPorts[2], false));
+    mallory.start(selfPath, nodeEnv("mallory", "24704", udpPorts[3], true));
 
     auto readyOf = [](Node *n) {
         const auto o = n->waitEvent("ready", {}, 15000);
@@ -559,9 +592,16 @@ static int parentMain(QCoreApplication &app) {
 
     // ---- S2 rooms + join + text chat (UC-05/06/08) ----
     alice.cmd("create 测试房间 open");
-    const QString roomA = alice.waitEvent("room", {}, 5000)["id"].toString();
-    if (roomA.size() != 16)
-        alice.fail("roomId not 16 hex");
+    const auto roomEvent = alice.waitEvent("room", {}, 5000);
+    const QString roomA = roomEvent["id"].toString();
+    const QString codeA = roomEvent["code"].toString();
+    if (roomA.size() != kRoomIdHexLen)
+        alice.fail("roomId is not a 32-hex room fingerprint");
+    if (codeA.size() != kInviteCodeDigits)
+        alice.fail("room invite code is not 6 digits");
+    for (const QChar c : codeA)
+        if (!c.isDigit())
+            alice.fail("room invite code contains non-digit characters");
     // it must show up in everyone's heartbeat room lists
     for (Node *n : {&bob, &carol, &mallory}) {
         QDeadlineTimer until(20000);
@@ -569,9 +609,14 @@ static int parentMain(QCoreApplication &app) {
         while (!until.hasExpired() && !seen) {
             n->cmd("rooms");
             const auto o = n->waitEvent("rooms", {}, 10000);
-            for (const auto &v : o["list"].toArray())
-                if (v.toObject()["id"].toString() == roomA)
+            for (const auto &v : o["list"].toArray()) {
+                const QJsonObject ro = v.toObject();
+                if (ro["id"].toString() == roomA) {
                     seen = true;
+                    if (ro["code"].toString() != codeA)
+                        n->fail("heartbeat room summary lost the invite code");
+                }
+            }
             if (!seen)
                 QThread::msleep(200);
         }
@@ -580,7 +625,8 @@ static int parentMain(QCoreApplication &app) {
     }
     bob.cmd(QStringLiteral("join %1").arg(roomA));
     bob.waitEvent("joincb", [](const QJsonObject &o) { return o["status"].toInt() == int(JoinStatus::Accepted); }, 10000);
-    carol.cmd(QStringLiteral("join %1").arg(roomA));
+    // carol joins through the six-digit invite code path (LAN-local lookup).
+    carol.cmd(QStringLiteral("join %1").arg(codeA));
     carol.waitEvent("joincb", [](const QJsonObject &o) { return o["status"].toInt() == int(JoinStatus::Accepted); }, 10000);
     {
         QDeadlineTimer until(15000);
@@ -750,7 +796,7 @@ static int parentMain(QCoreApplication &app) {
     if (doneMid <= 0)
         alice.fail("no chunk progress was persisted before the supplier crash (BR-23)");
     // restart the honest supplier with its persisted data dir -> resume continues (BR-20/23)
-    bob.start(selfPath, nodeEnv("bob", "24702", false));
+    bob.start(selfPath, nodeEnv("bob", "24702", udpPorts[1], false));
     readyOf(&bob);
     const auto done2 = alice.waitEvent("dl-done", [&](const QJsonObject &o) { return o["hash"].toString() == hash2; }, 120000);
     if (sha256OfFile(done2["dest"].toString()) != hash2)
@@ -796,7 +842,7 @@ static int parentMain(QCoreApplication &app) {
     alice.waitEvent("dl-start", [&](const QJsonObject &o) { return o["hash"].toString() == hash3; }, 15000);
     QThread::msleep(600); // persist a few chunks, then crash
     alice.killNow(); // simulated crash (no clean shutdown, no pause)
-    alice.start(selfPath, nodeEnv("alice", "24701", false));
+    alice.start(selfPath, nodeEnv("alice", "24701", udpPorts[0], false));
     const QString aliceFpBeforeRestart = alice.fp;
     readyOf(&alice);
     if (alice.fp != aliceFpBeforeRestart)
@@ -824,12 +870,38 @@ static int parentMain(QCoreApplication &app) {
     alice.waitEvent("destroyed", [](const QJsonObject &o) { return o["ok"].toBool(); }, 8000);
     bob.waitEvent("closed", [&](const QJsonObject &o) { return o["room"].toString() == roomA; }, 12000);
     alice.killNow();
-    alice.start(selfPath, nodeEnv("alice", "24701", false)); // restart: auto-creates brand-new identity
+    alice.start(selfPath, nodeEnv("alice", "24701", udpPorts[0], false)); // restart: auto-creates brand-new identity
     const QString oldFp = alice.fp;
     readyOf(&alice);
     if (alice.fp == oldFp)
         alice.fail("destroyAccount did not remove identity (new start reused old fp)");
     printf("[S9 destroy+reinit OK]\n");
+
+    // ---- S10 live LAN segment switch (network selection at runtime) ----
+    alice.cmd("segment");
+    const auto seg0 = alice.waitEvent("segment", {}, 5000);
+    if (seg0["ip"].toString() != QStringLiteral("127.0.0.1") || seg0["prefix"].toInt() != 8)
+        alice.fail("unexpected initial LAN segment (MESHLINK_IP override not applied)");
+    alice.cmd("switchseg 127.0.0.2 32"); // no existing peer can be inside this segment
+    alice.waitEvent("segswitched", [](const QJsonObject &o) { return o["ok"].toBool(); }, 5000);
+    QThread::msleep(300); // allow at least one heartbeat/filter cycle
+    alice.cmd("peers");
+    if (alice.waitEvent("peers", {}, 5000)["count"].toInt() != 0)
+        alice.fail("segment switch did not clear out-of-segment peers");
+    alice.cmd("switchseg 127.0.0.1 8"); // switch back to the shared test segment
+    alice.waitEvent("segswitched", [](const QJsonObject &o) { return o["ok"].toBool(); }, 5000);
+    {
+        QDeadlineTimer until(20000);
+        int count = 0;
+        while (!until.hasExpired() && count < 2) {
+            QThread::msleep(300);
+            alice.cmd("peers");
+            count = alice.waitEvent("peers", {}, 5000)["count"].toInt();
+        }
+        if (count < 2)
+            alice.fail("peers did not reappear after switching back (unicast bootstrap broken)");
+    }
+    printf("[S10 segment switch OK]\n");
 
     for (Node *n : {&alice, &bob, &carol, &mallory}) {
         if (n->proc && n->proc->state() == QProcess::Running) {

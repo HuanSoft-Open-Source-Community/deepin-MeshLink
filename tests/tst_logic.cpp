@@ -6,9 +6,16 @@
 // a descriptive message; success prints "tst_logic: ALL OK".
 #include "core/chunkplan.h"
 #include "core/crypto.h"
+#include "core/lansegment.h"
 #include "core/protocol.h"
+#include "core/storage.h"
 
 #include <QByteArray>
+#include <QCoreApplication>
+#include <QDir>
+#include <QHostAddress>
+#include <QSqlQuery>
+#include <QTemporaryDir>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -135,8 +142,9 @@ static int testSerializers() {
     }
     {
         RoomSnapshotMsg a, b;
-        a.roomId = "r";
+        a.roomId = QString(32, QLatin1Char('a'));
         a.name = QStringLiteral("研发讨论");
+        a.inviteCode = QStringLiteral("123456");
         a.policy = static_cast<quint8>(JoinPolicy::Approval);
         RoomMemberInfo mi;
         mi.fp = "f1";
@@ -150,6 +158,7 @@ static int testSerializers() {
         a.recent = {m, m};
         CHECK(RoomSnapshotMsg::fromPayload(a.toPayload(), b));
         CHECK(b.members.size() == 1 && b.recent.size() == 2 && b.recent[0].seq == 1 && b.policy == a.policy);
+        CHECK(b.inviteCode == a.inviteCode && b.roomId == a.roomId);
     }
     {
         // garbage payload must be rejected, not crash
@@ -211,8 +220,102 @@ static int testCrypto() {
     return 0;
 }
 
-int main() {
-    if (testFraming() || testSerializers() || testChunkPlan() || testCrypto())
+static int testLanSegment() {
+    LanSegment a{QStringLiteral("eth0"), QStringLiteral("192.168.1.23"), 24};
+    CHECK(a.isValid());
+    CHECK(a.broadcastAddress().toString() == QStringLiteral("192.168.1.255"));
+    CHECK(a.contains(QHostAddress(QStringLiteral("192.168.1.44"))));
+    CHECK(!a.contains(QHostAddress(QStringLiteral("192.168.2.1"))));
+    CHECK(!a.label().isEmpty());
+
+    LanSegment b{QStringLiteral("eth0"), QStringLiteral("10.1.2.3"), 16};
+    CHECK(b.broadcastAddress().toString() == QStringLiteral("10.1.255.255"));
+    CHECK(b.contains(QHostAddress(QStringLiteral("10.1.200.7"))));
+    CHECK(!b.contains(QHostAddress(QStringLiteral("10.2.0.1"))));
+
+    LanSegment slash32{QStringLiteral("eth0"), QStringLiteral("172.16.5.4"), 32};
+    CHECK(slash32.broadcastAddress().toString() == QStringLiteral("255.255.255.255"));
+    CHECK(!slash32.contains(QHostAddress(QStringLiteral("172.16.5.5"))));
+
+    LanSegment loop{QStringLiteral("lo"), QStringLiteral("127.0.0.1"), 8};
+    CHECK(loop.contains(QHostAddress(QStringLiteral("127.0.0.1"))));
+    CHECK(loop.broadcastAddress().toString() == QStringLiteral("255.255.255.255"));
+
+    const auto all = LanSegments::enumerate();
+    CHECK(!all.isEmpty());
+    for (const auto &s : all)
+        CHECK(s.isValid());
+    CHECK(LanSegments::preferred().isValid());
+    return 0;
+}
+
+static int testRoomMigration() {
+    QTemporaryDir tmp;
+    CHECK(tmp.isValid());
+    const QString path = tmp.filePath(QStringLiteral("migration.db"));
+    const QString oldRoom = QStringLiteral("0123456789abcdef"); // 16-hex id from the 1.0.0 build
+    {
+        Storage storage;
+        QString err;
+        CHECK(storage.open(path, &err));
+        QSqlQuery ins = storage.query(
+            "INSERT INTO rooms (room_id,name,intro,policy,global_mute,capacity,host_fp,hosted,joined,created_ts)"
+            " VALUES (?,?,?,0,0,0,?,'1',1,?)");
+        ins.bindValue(0, oldRoom);
+        ins.bindValue(1, QStringLiteral("旧房间"));
+        ins.bindValue(2, QString());
+        ins.bindValue(3, QStringLiteral("hostfp"));
+        ins.bindValue(4, 123456);
+        CHECK(ins.exec());
+        QSqlQuery member = storage.query(
+            "INSERT INTO members (room_id,fingerprint,nickname,role,joined_ts) VALUES (?,?,?,0,?)");
+        member.bindValue(0, oldRoom);
+        member.bindValue(1, QStringLiteral("memberfp"));
+        member.bindValue(2, QStringLiteral("成员"));
+        member.bindValue(3, 1);
+        CHECK(member.exec());
+        QSqlQuery msg = storage.query(
+            "INSERT INTO messages (msg_id,room_id,seq,sender_fp,ts) VALUES (?,?,1,?,?)");
+        msg.bindValue(0, QStringLiteral("m1"));
+        msg.bindValue(1, oldRoom);
+        msg.bindValue(2, QStringLiteral("memberfp"));
+        msg.bindValue(3, 1);
+        CHECK(msg.exec());
+        storage.close();
+    }
+    {
+        Storage storage;
+        QString err;
+        CHECK(storage.open(path, &err)); // migration runs here
+        QSqlQuery rooms = storage.query("SELECT room_id,invite_code FROM rooms");
+        CHECK(rooms.exec());
+        CHECK(rooms.next());
+        const QString newId = rooms.value(0).toString();
+        const QString code = rooms.value(1).toString();
+        CHECK(newId.size() == kRoomIdHexLen);
+        CHECK(newId != oldRoom);
+        CHECK(code.size() == kInviteCodeDigits);
+        for (const QChar c : code)
+            CHECK(c.isDigit());
+
+        QSqlQuery members = storage.query("SELECT COUNT(*) FROM members WHERE room_id=?");
+        members.bindValue(0, newId);
+        CHECK(members.exec());
+        CHECK(members.next() && members.value(0).toInt() == 1);
+        QSqlQuery stale = storage.query("SELECT COUNT(*) FROM messages WHERE room_id=?");
+        stale.bindValue(0, oldRoom);
+        CHECK(stale.exec());
+        CHECK(stale.next() && stale.value(0).toInt() == 0);
+        storage.close();
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    QCoreApplication app(argc, argv);
+    app.setApplicationName(QStringLiteral("tst_logic"));
+    if (testFraming() || testSerializers() || testChunkPlan() || testCrypto() || testLanSegment() ||
+        testRoomMigration())
         return 1;
     std::printf("tst_logic: ALL OK (%d checks)\n", g_checks);
     return 0;

@@ -107,6 +107,7 @@ void RoomsView::refreshRooms() {
                                                                      pend > 0 ? QStringLiteral(" ⚑%1").arg(pend) : QString()),
                                        m_roomList);
         it->setData(Qt::UserRole, r.roomId);
+        it->setToolTip(QStringLiteral("邀请码：%1\n房间指纹：%2").arg(r.inviteCode, r.roomId));
         if (r.roomId == keepId)
             m_roomList->setCurrentItem(it);
     }
@@ -148,7 +149,7 @@ void RoomsView::openCreateDialog() {
     connect(cancel, &QPushButton::clicked, &dlg, &QDialog::reject);
     connect(ok, &QPushButton::clicked, &dlg, [&] {
         QString err;
-        // roomId = SHA256(host_fp|name|ts)[0:16]; auto-created by core
+        // roomId = SHA256(host|name|inviteCode|ts)[0:32] + unique 6-digit invite code
         const QString id = m_engine->rooms()->createRoom(name->text(), intro->text(),
                                                          JoinPolicy(policy->currentData().toInt()), cap->value(), &err);
         if (id.isEmpty()) {
@@ -157,6 +158,10 @@ void RoomsView::openCreateDialog() {
         }
         dlg.accept();
         refreshRooms();
+        const RoomLocal created = m_engine->rooms()->room(id);
+        QMessageBox::information(this, QStringLiteral("聊天室已创建"),
+                                 QStringLiteral("邀请码：%1\n房间指纹：%2\n\n同一网段的成员可输入邀请码加入。")
+                                     .arg(created.inviteCode, created.roomId));
     });
     dlg.exec();
 }
@@ -171,6 +176,9 @@ void RoomsView::openManagementDialog(const QString &roomId) {
     dlg.resize(480, 520);
     auto *root = new QVBoxLayout(&dlg);
 
+    root->addWidget(new QLabel(QStringLiteral("邀请码：<b>%1</b> · 房间指纹：<span style='font-family:monospace'>%2</span>")
+                                   .arg(r.inviteCode, r.roomId),
+                               &dlg));
     root->addWidget(new QLabel(QStringLiteral("成员（双击成员行执行管理操作；权限遵循 UC-07 矩阵）"), &dlg));
     auto *members = new QListWidget(&dlg);
     auto fillMembers = [&] {

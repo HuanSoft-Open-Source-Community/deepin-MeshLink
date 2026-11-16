@@ -3,9 +3,13 @@
 // Copyright (C) 2026 HuanSoft Open Source Community <https://huansoft.org.cn>
 #pragma once
 
+#include "core/discovery.h"
+
 #include <QWidget>
 
 class QTableWidget;
+class QLabel;
+class QLineEdit;
 
 namespace meshlink {
 
@@ -19,12 +23,17 @@ public:
 private:
     void refreshPeers();
     void refreshRooms();
+    void refreshSegment();
     void joinSelected();
+    void joinByInviteCode();
+    void joinSummary(const RoomSummary &summary);
     void createRoomHere();
 
     Engine *m_engine;
+    QLabel *m_segment = nullptr;
     QTableWidget *m_peers = nullptr;
     QTableWidget *m_rooms = nullptr;
+    QLineEdit *m_inviteCode = nullptr;
 
 signals:
     void createRoomRequested(); // MainWindow forwards to RoomsView dialog

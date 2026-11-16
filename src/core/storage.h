@@ -31,6 +31,9 @@ public:
 
 private:
     bool createSchema(QString *error);
+    // Forward-only migration: adds invite_code, rekeys legacy 16-hex room ids to
+    // 32-hex, backfills missing invite codes. Idempotent.
+    bool migrate(QString *error);
 };
 
 } // namespace meshlink

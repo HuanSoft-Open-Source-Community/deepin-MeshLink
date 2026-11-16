@@ -3,11 +3,16 @@
 // Copyright (C) 2026 HuanSoft Open Source Community <https://huansoft.org.cn>
 #include "storage.h"
 
+#include "common.h"
+#include "crypto.h"
+
 #include <QDir>
 #include <QFileInfo>
+#include <QPair>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QVariant>
+#include <QVector>
 
 namespace meshlink {
 
@@ -26,6 +31,8 @@ bool Storage::open(const QString &filePath, QString *error) {
     // status updates; wait instead of failing on a transient lock (UC-11).
     db.exec("PRAGMA busy_timeout=8000");
     if (!createSchema(error))
+        return false;
+    if (!migrate(error))
         return false;
     return true;
 }
@@ -101,6 +108,7 @@ bool Storage::createSchema(QString *error) {
         // UC-05/06/07: rooms + membership.
         "CREATE TABLE IF NOT EXISTS rooms ("
         " room_id TEXT PRIMARY KEY, name TEXT, intro TEXT,"
+        " invite_code TEXT,"
         " policy INTEGER, global_mute INTEGER DEFAULT 0,"
         " capacity INTEGER DEFAULT 0, host_fp TEXT, hosted INTEGER DEFAULT 0,"
         " joined INTEGER DEFAULT 0, created_ts INTEGER)",
@@ -164,6 +172,152 @@ bool Storage::createSchema(QString *error) {
     for (const char *sql : ddl) {
         if (!exec(sql, error))
             return false;
+    }
+    return true;
+}
+
+namespace {
+
+bool tableHasColumn(const QSqlDatabase &database, const QString &table, const QString &column) {
+    QSqlQuery info(database);
+    if (!info.exec(QStringLiteral("PRAGMA table_info(%1)").arg(table)))
+        return false;
+    while (info.next())
+        if (info.value(1).toString() == column)
+            return true;
+    return false;
+}
+
+QString freshInviteCode(const QSqlDatabase &database) {
+    for (int attempt = 0; attempt < 128; ++attempt) {
+        const Bytes bytes = Crypto::randomBytes(4);
+        const quint32 value = (quint32(bytes[0]) << 24) | (quint32(bytes[1]) << 16) | (quint32(bytes[2]) << 8) |
+                              quint32(bytes[3]);
+        const QString code =
+            QStringLiteral("%1").arg(value % 1000000u, kInviteCodeDigits, 10, QChar('0'));
+        QSqlQuery exists(database);
+        exists.prepare("SELECT 1 FROM rooms WHERE invite_code=?");
+        exists.addBindValue(code);
+        if (exists.exec() && !exists.next())
+            return code;
+    }
+    return {};
+}
+
+} // namespace
+
+bool Storage::migrate(QString *error) {
+    QSqlDatabase database = db();
+    // v2 schema additions on databases created by the 1.0.0 alpha build.
+    if (!tableHasColumn(database, "rooms", "invite_code")) {
+        QSqlQuery alter(database);
+        if (!alter.exec("ALTER TABLE rooms ADD COLUMN invite_code TEXT")) {
+            if (error)
+                *error = alter.lastError().text();
+            return false;
+        }
+    }
+
+    // Collect legacy rooms first: SQLite does not like updating a table while a
+    // cursor over the same table is still open.
+    QVector<QPair<QString, QString>> rekeys; // old room id -> new 32-hex id
+    {
+        QSqlQuery q(database);
+        if (!q.exec("SELECT room_id,COALESCE(host_fp,''),COALESCE(created_ts,0) FROM rooms")) {
+            if (error)
+                *error = q.lastError().text();
+            return false;
+        }
+        while (q.next()) {
+            const QString oldId = q.value(0).toString();
+            if (oldId.size() == kRoomIdHexLen)
+                continue;
+            const QString host = q.value(1).toString();
+            const qint64 createdTs = q.value(2).toLongLong();
+            QString newId;
+            for (int salt = 0; salt < 32 && newId.isEmpty(); ++salt) {
+                const QByteArray seed = QStringLiteral("legacy-room|%1|%2|%3|%4")
+                                            .arg(oldId, host)
+                                            .arg(createdTs)
+                                            .arg(salt)
+                                            .toUtf8();
+                const QString candidate = QString::fromLatin1(
+                    Crypto::sha256Hex(reinterpret_cast<const uint8_t *>(seed.constData()), size_t(seed.size()))
+                        .substr(0, kRoomIdHexLen)
+                        .c_str());
+                QSqlQuery exists(database);
+                exists.prepare("SELECT 1 FROM rooms WHERE room_id=?");
+                exists.addBindValue(candidate);
+                if (exists.exec() && !exists.next())
+                    newId = candidate;
+            }
+            if (newId.isEmpty()) {
+                if (error)
+                    *error = QStringLiteral("无法为旧聊天室 %1 生成新的 32 位指纹 ID").arg(oldId);
+                return false;
+            }
+            rekeys.append({oldId, newId});
+        }
+    }
+
+    if (!database.transaction()) {
+        if (error)
+            *error = database.lastError().text();
+        return false;
+    }
+    auto fail = [&](const QString &why) {
+        database.rollback();
+        if (error)
+            *error = why;
+        return false;
+    };
+    auto update = [&](const QString &sql, const QVariant &a, const QVariant &b) {
+        QSqlQuery q(database);
+        q.prepare(sql);
+        q.addBindValue(a);
+        q.addBindValue(b);
+        if (!q.exec()) {
+            fail(q.lastError().text());
+            return false;
+        }
+        return true;
+    };
+
+    for (const auto &pair : rekeys) {
+        for (const char *table : {"members", "messages", "file_announce", "blacklist", "approvals", "downloads"}) {
+            if (!update(QStringLiteral("UPDATE %1 SET room_id=? WHERE room_id=?").arg(table), pair.second,
+                        pair.first))
+                return false;
+        }
+        if (!update(QStringLiteral("UPDATE rooms SET room_id=? WHERE room_id=?"), pair.second, pair.first))
+            return false;
+    }
+
+    QVector<QString> roomsWithoutCode;
+    {
+        QSqlQuery q(database);
+        if (!q.exec("SELECT room_id FROM rooms WHERE invite_code IS NULL OR invite_code=''"))
+            return fail(q.lastError().text());
+        while (q.next())
+            roomsWithoutCode.append(q.value(0).toString());
+    }
+    for (const auto &roomId : roomsWithoutCode) {
+        const QString code = freshInviteCode(database);
+        if (code.isEmpty())
+            return fail(QStringLiteral("无法生成唯一邀请码"));
+        QSqlQuery q(database);
+        q.prepare("UPDATE rooms SET invite_code=? WHERE room_id=?");
+        q.addBindValue(code);
+        q.addBindValue(roomId);
+        if (!q.exec())
+            return fail(q.lastError().text());
+    }
+
+    if (!database.commit()) {
+        database.rollback();
+        if (error)
+            *error = database.lastError().text();
+        return false;
     }
     return true;
 }

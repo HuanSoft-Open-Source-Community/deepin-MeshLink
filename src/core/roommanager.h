@@ -23,7 +23,7 @@ class AccountManager;
 class Settings;
 
 struct RoomLocal {
-    QString roomId, name, intro, hostFp;
+    QString roomId, name, intro, hostFp, inviteCode;
     JoinPolicy policy = JoinPolicy::Open;
     bool globalMute = false;
     int capacity = 0;      // 0 = unlimited
@@ -56,6 +56,8 @@ public:
 
     // ---- UC-05 ----
     QString createRoom(const QString &name, const QString &intro, JoinPolicy policy, int capacity, QString *error);
+    // Six decimal digits (000000-999999), used for LAN-local, discovery-scoped joins.
+    static bool isValidInviteCode(const QString &code);
 
     // ---- UC-06 ----
     void joinRoom(const RoomSummary &summary, JoinCb cb);

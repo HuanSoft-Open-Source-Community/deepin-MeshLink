@@ -128,14 +128,15 @@ MESH_LINK_IMPL_SIMPLE(JoinResponseMsg, (ds << roomId << fingerprint << status <<
 
 QByteArray RoomSnapshotMsg::toPayload() const {
     return payloadOf([this](QDataStream &ds) {
-        ds << roomId << name << intro << policy << globalMute << capacity << memberCount;
+        ds << roomId << name << intro << inviteCode << policy << globalMute << capacity << memberCount;
         writeMemberList(ds, members);
         writeMsgList(ds, recent);
     });
 }
 bool RoomSnapshotMsg::fromPayload(const QByteArray &p, RoomSnapshotMsg &m) {
     return readPayload(p, [&m](QDataStream &ds) {
-        ds >> m.roomId >> m.name >> m.intro >> m.policy >> m.globalMute >> m.capacity >> m.memberCount;
+        ds >> m.roomId >> m.name >> m.intro >> m.inviteCode >> m.policy >> m.globalMute >> m.capacity
+           >> m.memberCount;
         m.members = readMemberList(ds);
         m.recent = readMsgList(ds);
         return ds.status() != QDataStream::ReadPastEnd;
