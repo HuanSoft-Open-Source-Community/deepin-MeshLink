@@ -6,7 +6,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(deepin-meshlink
-    VERSION 1.0.0
+    VERSION 26.4.0.0
     DESCRIPTION "LAN decentralised instant-messaging client (deepin-MeshLink)"
     HOMEPAGE_URL "https://huansoft.org.cn"
     LANGUAGES CXX)
@@ -58,6 +58,7 @@ set(CORE_SOURCES
     src/core/account.cpp
     src/core/storage.cpp
     src/core/settings.cpp
+    src/core/lansegment.cpp
     src/core/discovery.cpp
     src/core/securelink.cpp
     src/core/roommanager.cpp
@@ -73,6 +74,7 @@ set(CORE_HEADERS
     src/core/account.h
     src/core/storage.h
     src/core/settings.h
+    src/core/lansegment.h
     src/core/discovery.h
     src/core/securelink.h
     src/core/roommanager.h
@@ -94,7 +96,8 @@ target_link_libraries(meshlink_core PUBLIC
     Dtk6::Core
     OpenSSL::Crypto OpenSSL::SSL)
 target_compile_definitions(meshlink_core PUBLIC
-    MESHLINK_VERSION="${PROJECT_VERSION}")
+    MESHLINK_VERSION="${PROJECT_VERSION}"
+    MESHLINK_STAGE="alpha")
 
 # ---------------------------------------------------------------------------
 # deepin-meshlink : the DTK6 GUI application

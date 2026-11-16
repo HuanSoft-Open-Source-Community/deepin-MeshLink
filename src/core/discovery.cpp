@@ -19,9 +19,10 @@ static QByteArray encodeHeartbeat(const QString &fp, const QString &nick, const 
                                  const QString &ip, quint16 port, qint64 upSince, bool farewell,
                                  const QVector<RoomSummary> &rooms) {
     return payloadOf([&](QDataStream &ds) {
-        ds << fp << nick << avatar << ip << port << upSince << farewell << static_cast<quint32>(rooms.size());
+        ds << kHeartbeatFormat << fp << nick << avatar << ip << port << upSince << farewell
+           << static_cast<quint32>(rooms.size());
         for (const auto &r : rooms) {
-            ds << r.roomId << r.name << r.members << static_cast<quint8>(r.policy) << r.hostFp;
+            ds << r.roomId << r.name << r.inviteCode << r.members << static_cast<quint8>(r.policy) << r.hostFp;
         }
     });
 }
@@ -54,12 +55,10 @@ void Discovery::stop() {
     if (!m_running)
         return;
     m_running = false;
-    // UC-04 A1 signed farewell so peers remove us immediately.
+    // UC-04 A1 signed farewell to the selected segment so peers remove us now.
     QByteArray dgram = buildDatagram(/*farewell=*/true);
-    for (const auto &addr : QNetworkInterface::allAddresses()) {
-        if (addr.protocol() == QAbstractSocket::IPv4Protocol && !addr.isLoopback())
-            m_socket->writeDatagram(dgram, QHostAddress(QHostAddress::Broadcast), m_port);
-    }
+    if (m_socket)
+        m_socket->writeDatagram(dgram, broadcastTarget(), m_port);
     m_timer.stop();
 }
 
@@ -87,6 +86,47 @@ void Discovery::setHostedRooms(const QVector<RoomSummary> &rooms) {
     if (qEnvironmentVariableIsSet("MESHLINK_DEBUG"))
         fprintf(stderr, "[disc] setHostedRooms n=%d\n", (int)rooms.size());
 }
+
+void Discovery::setSegment(const LanSegment &segment) {
+    if (segment.isValid())
+        m_segment = segment;
+}
+
+void Discovery::switchSegment(const LanSegment &segment) {
+    if (!segment.isValid())
+        return;
+    if (m_running && m_socket) {
+        // Best-effort farewell on the old segment before leaving it.
+        const QByteArray farewell = buildDatagram(/*farewell=*/true);
+        m_socket->writeDatagram(farewell, broadcastTarget(), m_port);
+    }
+    setSegment(segment);
+    const auto previous = m_peerTable;
+    m_peerTable.clear();
+    for (auto it = previous.begin(); it != previous.end(); ++it)
+        emit peerGone(it.key());
+    emit peersChanged();
+    if (qEnvironmentVariableIsSet("MESHLINK_DEBUG"))
+        fprintf(stderr, "[disc] segment switched: %s\n", qUtf8Printable(m_segment.label()));
+    if (m_running)
+        onTick(); // announce immediately on the new segment
+}
+
+QHostAddress Discovery::broadcastTarget() const {
+    if (!m_segment.isValid())
+        return QHostAddress(QHostAddress::Broadcast);
+    return m_segment.broadcastAddress();
+}
+
+bool Discovery::senderAllowed(const QHostAddress &senderIp) const {
+    if (!m_segment.isValid())
+        return true;
+    // Strict segment filter. Manual bootstrap targets only change where we
+    // *send* unicast heartbeats (broadcast-blocked LANs); inbound traffic from
+    // outside the selected segment is ignored.
+    return m_segment.contains(senderIp);
+}
+
 void Discovery::setSigner(std::function<bool(const QByteArray &, QByteArray *)> signer) {
     m_signer = std::move(signer);
 }
@@ -116,7 +156,8 @@ void Discovery::onTick() {
     if (!m_socket)
         return;
     QByteArray dgram = buildDatagram(false);
-    qint64 sent = m_socket->writeDatagram(dgram, QHostAddress(QHostAddress::Broadcast), m_port);
+    const QHostAddress target = broadcastTarget();
+    qint64 sent = m_socket->writeDatagram(dgram, target, m_port);
     static int dbgN = 0;
     if (qEnvironmentVariableIsSet("MESHLINK_DEBUG") && ++dbgN % 10 == 1)
         fprintf(stderr, "[disc %s dbg] state=%d bound=%u sent=%lld err=%s peers=%d targets=%d hosted=%d\n", qgetenv("MESHLINK_NODE").constData(),
@@ -149,6 +190,15 @@ void Discovery::onReadPending() {
 }
 
 void Discovery::handleDatagram(const QByteArray &dgram, const QHostAddress &senderIp) {
+    // A machine may sit on several networks; only heartbeats from the selected
+    // segment (plus explicitly configured bootstrap peers) are accepted.
+    if (!senderAllowed(senderIp)) {
+        ++m_droppedOutOfSegment;
+        if (qEnvironmentVariableIsSet("MESHLINK_DEBUG") && m_droppedOutOfSegment % 20 == 1)
+            fprintf(stderr, "[disc] dropped out-of-segment packet from %s (segment %s)\n",
+                    qUtf8Printable(senderIp.toString()), qUtf8Printable(m_segment.label()));
+        return;
+    }
     if (dgram.size() < 96) {
         ++m_droppedInvalid;
         return;
@@ -177,6 +227,12 @@ void Discovery::handleDatagram(const QByteArray &dgram, const QHostAddress &send
 
     QDataStream ds(payload);
     ds.setVersion(QDataStream::Qt_6_0);
+    quint8 format = 0;
+    ds >> format;
+    if (format != kHeartbeatFormat) { // alpha rollout: reject incompatible formats
+        ++m_droppedInvalid;
+        return;
+    }
     QString fp, nick, avatar, ip;
     quint16 port = 0;
     qint64 upSince = 0;
@@ -195,7 +251,7 @@ void Discovery::handleDatagram(const QByteArray &dgram, const QHostAddress &send
     for (quint32 i = 0; i < nRooms && i < 64; ++i) {
         RoomSummary r;
         quint8 pol = 0;
-        ds >> r.roomId >> r.name >> r.members >> pol >> r.hostFp;
+        ds >> r.roomId >> r.name >> r.inviteCode >> r.members >> pol >> r.hostFp;
         r.policy = static_cast<JoinPolicy>(pol);
         rooms.append(r);
     }
@@ -241,6 +297,40 @@ std::optional<PeerInfo> Discovery::peer(const QString &fp) const {
     if (it == m_peerTable.end())
         return std::nullopt;
     return *it;
+}
+
+QVector<RoomSummary> Discovery::roomCatalogue() const {
+    QVector<RoomSummary> out;
+    for (const auto &p : m_peerTable) {
+        if (!p.online)
+            continue;
+        out += p.hostedRooms;
+    }
+    return out;
+}
+
+std::optional<RoomSummary> Discovery::roomById(const QString &roomId) const {
+    for (const auto &p : m_peerTable) {
+        if (!p.online)
+            continue;
+        for (const auto &r : p.hostedRooms)
+            if (r.roomId == roomId)
+                return r;
+    }
+    return std::nullopt;
+}
+
+std::optional<RoomSummary> Discovery::roomByInviteCode(const QString &inviteCode) const {
+    if (inviteCode.size() != kInviteCodeDigits)
+        return std::nullopt;
+    for (const auto &p : m_peerTable) {
+        if (!p.online)
+            continue;
+        for (const auto &r : p.hostedRooms)
+            if (r.inviteCode == inviteCode)
+                return r;
+    }
+    return std::nullopt;
 }
 
 } // namespace meshlink

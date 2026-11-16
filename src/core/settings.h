@@ -3,6 +3,8 @@
 // Copyright (C) 2026 HuanSoft Open Source Community <https://huansoft.org.cn>
 #pragma once
 
+#include "lansegment.h"
+
 #include <QObject>
 #include <QSettings>
 #include <QString>
@@ -55,7 +57,10 @@ public:
     void addBootstrapTarget(const QString &ip, quint16 port);
     void setBootstrapTargets(const QStringList &entries);
 
-    QString lanIpAddress() const; // best-effort local LAN IPv4 (UC-01 step 7)
+    // Selected LAN segment (persisted; MESHLINK_IP overrides it for tests).
+    LanSegment lanSegment() const;
+    void setLanSegment(const LanSegment &segment);
+    QString lanIpAddress() const; // segment address (UC-01 step 7)
 
 signals:
     void changed();

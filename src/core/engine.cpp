@@ -97,13 +97,15 @@ bool Engine::start(QString *error) {
         return false;
     }
 
-    m_lanIp = m_settings->lanIpAddress();
+    m_segment = m_settings->lanSegment();
+    m_lanIp = m_segment.ip;
     m_account.setLanIp(m_lanIp);
 
     const auto prof = m_account.profile();
     m_discovery.setSigner([this](const QByteArray &in, QByteArray *out) { return m_account.sign(in, out); });
     m_discovery.setSelf(prof.fingerprint, prof.nickname, prof.avatarHash, m_account.publicKey());
     m_discovery.setSelfEndpoint(m_lanIp, m_settings->tcpPort());
+    m_discovery.setSegment(m_segment);
 
     QString lerr;
     if (!m_link.listen(m_settings->tcpPort(), &lerr)) { // UC-04 E1 (TCP side)
@@ -134,6 +136,26 @@ void Engine::shutdown() {
     m_discovery.stop(); // signed farewell first (UC-04 A1)
     m_link.stopListening();
     m_storage.close();
+}
+
+bool Engine::setLanSegment(const LanSegment &segment, QString *error) {
+    if (!segment.isValid()) {
+        if (error)
+            *error = QStringLiteral("无效的局域网网段：%1/%2").arg(segment.ip).arg(segment.prefixLength);
+        return false;
+    }
+    if (segment == m_segment) {
+        m_settings->setLanSegment(segment);
+        return true;
+    }
+    m_segment = segment;
+    m_lanIp = segment.ip;
+    m_settings->setLanSegment(segment);
+    m_account.setLanIp(segment.ip);
+    m_discovery.setSelfEndpoint(segment.ip, m_settings->tcpPort());
+    m_discovery.switchSegment(segment);
+    emit lanSegmentChanged(segment.label());
+    return true;
 }
 
 bool Engine::createFreshAccount(const QString &nickname, QString *error) {

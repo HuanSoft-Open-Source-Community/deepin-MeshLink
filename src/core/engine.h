@@ -34,6 +34,11 @@ public:
     // first-start wizard before start() loads the profile into memory).
     bool hasLocalAccount();
 
+    // LAN segment: chosen in the wizard and switchable at runtime.
+    bool setLanSegment(const LanSegment &segment, QString *error);
+    const LanSegment &lanSegment() const { return m_segment; }
+    QString lanSegmentLabel() const { return m_segment.label(); }
+
     // A2 (UC-01): create a brand-new identity, wiping any existing one.
     bool createFreshAccount(const QString &nickname, QString *error);
     // UC-02: destroy local account, keys and history.
@@ -60,6 +65,7 @@ public:
 signals:
     void spoofingSuspected(const QString &fingerprint); // UC-03 A1 surfaced to UI
     void started(bool ok);
+    void lanSegmentChanged(const QString &label);
 
 private:
     void route(MsgType type, SecureChannel *ch, const QByteArray &payload);
@@ -68,6 +74,7 @@ private:
     Storage m_storage;
     AccountManager m_account;
     Discovery m_discovery;
+    LanSegment m_segment;
     SecureLink m_link;
     RoomManager m_rooms;
     ChatManager m_chat;

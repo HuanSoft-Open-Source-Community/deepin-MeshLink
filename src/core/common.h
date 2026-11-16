@@ -17,22 +17,26 @@ namespace meshlink {
 inline constexpr const char *kAppId = "cn.org.huansoft.deepin-meshlink";
 inline constexpr const char *kAppName = "deepin-meshlink";
 inline constexpr const char *kDisplayName = "\xe6\xb7\xb1\xe5\xba\xa6\xe7\xbb\x87\xe8\xae\xaf"; // 深度织讯
-inline constexpr const char *kVersion = "1.0.0";
+inline constexpr const char *kVersion = "26.4.0.0"; // <yy>.<quarter>.<x>.<y>
+inline constexpr const char *kStage = "alpha";
 inline constexpr const char *kOrgName = "HuanSoft Open Source Community";
 inline constexpr const char *kOrgDomain = "huansoft.org.cn";
 
 // ---- wire constants ----
 inline constexpr quint32 kFrameMagic = 0x4D4C4E4B; // "MLNK"
-inline constexpr quint8 kProtoVersion = 1;
+inline constexpr quint8 kProtoVersion = 2;          // v2: 32-hex room ids + invite codes
+inline constexpr quint8 kHeartbeatFormat = 2;       // v2: room summaries carry invite codes
 inline constexpr int kFrameHeaderSize = 12; // magic4+ver1+type1+reserved2+len4
 inline constexpr quint32 kMaxFramePayload = 8u * 1024 * 1024; // 8 MiB
 inline constexpr quint32 kMaxUdpPacket = 1400;                // stays under MTU (BR-08)
 inline constexpr int kMaxHeartbeatRooms = 8;                  // room summaries per heartbeat
+inline constexpr int kRoomIdHexLen = 32;                      // room fingerprint id
+inline constexpr int kInviteCodeDigits = 6;                   // numeric invite code
 
 using MsgId = QString;   // random 16-hex
 using FileHash = QString; // 64-hex sha256
 using PeerId = QString;  // 32-hex account fingerprint
-using RoomId = QString;  // 16-hex, derived on creation
+using RoomId = QString;  // 32-hex room fingerprint, derived on creation
 
 enum class JoinPolicy : quint8 { Open = 0, Approval = 1 };
 

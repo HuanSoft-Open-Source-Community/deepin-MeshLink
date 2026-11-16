@@ -4,14 +4,16 @@
 #include "settingsview.h"
 
 #include "core/engine.h"
+#include "core/lansegment.h"
 #include "core/settings.h"
 
 #include <DDialog>
 
 #include <QApplication>
-
+#include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
+#include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
 #include <QSpinBox>
@@ -27,6 +29,15 @@ SettingsView::SettingsView(Engine *engine, QWidget *parent) : QWidget(parent), m
     root->addWidget(new QLabel(QStringLiteral("<b>网络与传输参数</b>（持久化于用户配置；端口类修改需重启生效）"), this));
 
     auto *form = new QFormLayout;
+    m_segments = new QComboBox(this);
+    auto *segRow = new QWidget(this);
+    auto *segLay = new QHBoxLayout(segRow);
+    segLay->setContentsMargins(0, 0, 0, 0);
+    segLay->addWidget(m_segments, 1);
+    auto *refresh = new QPushButton(QStringLiteral("刷新"), segRow);
+    segLay->addWidget(refresh);
+    connect(refresh, &QPushButton::clicked, this, &SettingsView::reloadSegments);
+    form->addRow(QStringLiteral("局域网网段："), segRow);
     m_udp = new QSpinBox(this);
     m_udp->setRange(1024, 65535);
     m_udp->setSuffix(QStringLiteral("（默认 2425）"));
@@ -81,7 +92,7 @@ SettingsView::SettingsView(Engine *engine, QWidget *parent) : QWidget(parent), m
     root->addWidget(m_status);
 
     auto *about = new QLabel(
-        QStringLiteral("<b>深度织讯 deepin-MeshLink</b> v" MESHLINK_VERSION "<br>"
+        QStringLiteral("<b>深度织讯 deepin-MeshLink</b> v" MESHLINK_VERSION " " MESHLINK_STAGE "<br>"
                        "开发主体：<a href='https://huansoft.org.cn'>HuanSoft 开源社区</a><br>"
                        "许可：GPL-3.0-or-later · 全链路 TLS 1.3 · 无中心服务器"),
         this);
@@ -94,6 +105,7 @@ SettingsView::SettingsView(Engine *engine, QWidget *parent) : QWidget(parent), m
 
 void SettingsView::load() {
     auto *s = m_engine->settings();
+    reloadSegments();
     m_udp->setValue(s->discoveryPort());
     m_tcp->setValue(s->tcpPort());
     m_hb->setValue(s->heartbeatIntervalMs());
@@ -103,8 +115,39 @@ void SettingsView::load() {
     m_history->setValue(s->maxRoomHistory());
 }
 
+void SettingsView::reloadSegments() {
+    auto *s = m_engine->settings();
+    const LanSegment active = s->lanSegment();
+    const bool forced = LanSegments::fromEnvironment().isValid();
+    m_segmentList = LanSegments::enumerate();
+    m_segments->clear();
+    int select = -1;
+    for (int i = 0; i < m_segmentList.size(); ++i) {
+        const auto &seg = m_segmentList[i];
+        m_segments->addItem(seg.label());
+        if (seg.ip == active.ip && seg.prefixLength == active.prefixLength)
+            select = i;
+    }
+    if (select < 0 && !m_segmentList.isEmpty())
+        select = 0;
+    if (select >= 0)
+        m_segments->setCurrentIndex(select);
+    m_segments->setEnabled(!forced);
+    m_segments->setToolTip(forced ? QStringLiteral("当前由 MESHLINK_IP 环境变量固定，界面选择不生效")
+                                  : QStringLiteral("切换后立即在新网段广播心跳，旧网段 peer 会被清空"));
+}
+
 void SettingsView::apply() {
     auto *s = m_engine->settings();
+    const int row = m_segments->currentIndex();
+    if (!LanSegments::fromEnvironment().isValid() && row >= 0 && row < m_segmentList.size()) {
+        QString segError;
+        if (!m_engine->setLanSegment(m_segmentList[row], &segError)) {
+            m_status->setStyleSheet(QStringLiteral("color:#e53935;"));
+            m_status->setText(segError);
+            return;
+        }
+    }
     s->setDiscoveryPort(quint16(m_udp->value()));
     s->setTcpPort(quint16(m_tcp->value()));
     s->setHeartbeatIntervalMs(m_hb->value());
@@ -114,7 +157,8 @@ void SettingsView::apply() {
     s->setMaxRoomHistory(m_history->value());
     // heartbeat cadence applies live to the running discovery loop:
     m_engine->discovery()->restartTimer();
-    m_status->setText(QStringLiteral("已保存（端口改动需重启后监听新端口）"));
+    m_status->setStyleSheet(QStringLiteral("color:#43a047;"));
+    m_status->setText(QStringLiteral("已保存：网段与心跳即时生效，端口改动需重启后监听新端口"));
 }
 
 } // namespace meshlink

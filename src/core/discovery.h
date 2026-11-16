@@ -10,6 +10,7 @@
 #pragma once
 
 #include "common.h"
+#include "lansegment.h"
 
 #include <QObject>
 #include <QHostAddress>
@@ -22,7 +23,7 @@
 namespace meshlink {
 
 struct RoomSummary {
-    QString roomId, name;
+    QString roomId, name, inviteCode;
     int members = 0;
     JoinPolicy policy = JoinPolicy::Open;
     QString hostFp;
@@ -54,6 +55,15 @@ public:
     void setSelf(const QString &fp, const QString &nickname, const QString &avatarHash, const QByteArray &ed25519Pub);
     void setSelfEndpoint(const QString &ip, quint16 tcpPort);
     void setHostedRooms(const QVector<RoomSummary> &rooms);
+
+    // LAN segment: heartbeats are broadcast into (and only accepted from) this
+    // IPv4 subnet. switchSegment() clears the peer table and re-announces, so
+    // the user can move between networks without restarting the app.
+    void setSegment(const LanSegment &segment);
+    void switchSegment(const LanSegment &segment);
+    LanSegment segment() const { return m_segment; }
+    int droppedOutOfSegmentCount() const { return m_droppedOutOfSegment; }
+
     // Sign callback bound to the account's Ed25519 private key (NFR-14).
     void setSigner(std::function<bool(const QByteArray &, QByteArray *)> signer);
 
@@ -64,6 +74,11 @@ public:
     QVector<PeerInfo> peers() const;
     bool isPeerOnline(const QString &fp) const;
     std::optional<PeerInfo> peer(const QString &fp) const;
+
+    // Joinable room catalogue gathered from the heartbeats of online peers.
+    QVector<RoomSummary> roomCatalogue() const;
+    std::optional<RoomSummary> roomById(const QString &roomId) const;
+    std::optional<RoomSummary> roomByInviteCode(const QString &inviteCode) const;
 
     quint16 boundPort() const { return m_port; }
     void restartTimer(); // settings live-apply (defined in .cpp; needs Settings)
@@ -83,6 +98,8 @@ private slots:
 private:
     QByteArray buildDatagram(bool farewell);
     void handleDatagram(const QByteArray &dgram, const QHostAddress &senderIp);
+    bool senderAllowed(const QHostAddress &senderIp) const;
+    QHostAddress broadcastTarget() const;
 
     QUdpSocket *m_socket = nullptr;
     QTimer m_timer;
@@ -91,6 +108,7 @@ private:
     QString m_fp, m_nickname, m_avatarHash, m_ip;
     quint16 m_portTcp = 0;
     QByteArray m_edPub;
+    LanSegment m_segment;
     std::function<bool(const QByteArray &, QByteArray *)> m_signer;
     QVector<RoomSummary> m_rooms;
     QVector<QPair<QString, quint16>> m_manualTargets;
@@ -98,6 +116,7 @@ private:
     qint64 m_upSince = 0;
     qint64 m_lastRx = 0;
     int m_droppedInvalid = 0;
+    int m_droppedOutOfSegment = 0;
     bool m_running = false;
 };
 

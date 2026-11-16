@@ -3,10 +3,15 @@
 // Copyright (C) 2026 HuanSoft Open Source Community <https://huansoft.org.cn>
 #pragma once
 
+#include "core/lansegment.h"
+
 #include <DDialog>
+
+#include <QVector>
 
 class QLineEdit;
 class QLabel;
+class QComboBox;
 
 namespace meshlink {
 
@@ -24,9 +29,14 @@ public:
 
 private:
     void createAccount();
+    void reloadSegments();
+    LanSegment selectedSegment() const;
+
     Engine *m_engine;
     QLineEdit *m_nick = nullptr;
+    QComboBox *m_segments = nullptr;
     QLabel *m_error = nullptr;
+    QVector<LanSegment> m_segmentList;
 };
 
 } // namespace meshlink

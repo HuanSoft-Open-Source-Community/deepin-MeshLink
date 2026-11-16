@@ -74,6 +74,7 @@ MainWindow::MainWindow(Engine *engine, QWidget *parent) : DMainWindow(parent), m
     connect(m_engine->discovery(), &Discovery::peerGone, this, &MainWindow::refreshStatus);
     connect(m_engine->discovery(), &Discovery::peersChanged, this, &MainWindow::refreshStatus);
     connect(m_engine->rooms(), &RoomManager::roomsChanged, this, &MainWindow::refreshStatus);
+    connect(m_engine, &Engine::lanSegmentChanged, this, &MainWindow::refreshStatus);
 
     // UC-03 A1 / UC-04 E3: suspected MITM surfaced globally
     connect(m_engine, &Engine::spoofingSuspected, this, [this](const QString &fp) {
@@ -134,8 +135,9 @@ void MainWindow::refreshStatus() {
     for (const auto &r : m_engine->rooms()->myRooms())
         if (r.hosted)
             ++hosted;
-    m_statusLabel->setText(QStringLiteral("指纹 %1… · %2:%3 (UDP %4) · 在线节点 %5 · 我托管的房间 %6")
-                               .arg(prof.fingerprint.left(12), m_engine->tcpEndpointIp())
+    m_statusLabel->setText(QStringLiteral("指纹 %1… · 网段 %2 · %3:%4 (UDP %5) · 在线节点 %6 · 我托管的房间 %7")
+                               .arg(prof.fingerprint.left(12), m_engine->lanSegmentLabel())
+                               .arg(m_engine->tcpEndpointIp())
                                .arg(m_engine->tcpEndpointPort())
                                .arg(m_engine->settings()->discoveryPort())
                                .arg(online)

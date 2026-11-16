@@ -4,11 +4,9 @@
 #include "settings.h"
 
 #include "common.h"
+#include "lansegment.h"
 
 #include <QDir>
-#include <QHostAddress>
-#include <QHostInfo>
-#include <QNetworkInterface>
 #include <QStandardPaths>
 
 namespace meshlink {
@@ -127,36 +125,39 @@ void Settings::setBootstrapTargets(const QStringList &entries) {
     emit changed();
 }
 
-QString Settings::lanIpAddress() const {
-    // integration harness may pin a loopback/deterministic address
-    const QByteArray forced = qgetenv("MESHLINK_IP");
-    if (!forced.isEmpty())
-        return QString::fromLatin1(forced);
-    // UC-01 step 7: pick a routable non-loopback IPv4 on an operational interface.
-    const auto ifaces = QNetworkInterface::allInterfaces();
-    QString best;
-    for (const auto &iface : ifaces) {
-        if (iface.flags().testFlag(QNetworkInterface::IsLoopBack))
-            continue;
-        if (!iface.flags().testFlag(QNetworkInterface::IsUp))
-            continue;
-        for (const auto &entry : iface.addressEntries()) {
-            const QHostAddress addr = entry.ip();
-            if (addr.protocol() != QAbstractSocket::IPv4Protocol || addr.isLoopback())
-                continue;
-            if (addr.isInSubnet(QHostAddress("169.254.0.0"), 16)) // link-local fallback
-                continue;
-            return addr.toString();
-        }
-        if (best.isEmpty()) {
-            for (const auto &entry : iface.addressEntries()) {
-                const QHostAddress addr = entry.ip();
-                if (addr.protocol() == QAbstractSocket::IPv4Protocol)
-                    best = addr.toString();
+LanSegment Settings::lanSegment() const {
+    // Tests/headless runs pin the segment through the environment.
+    const LanSegment env = LanSegments::fromEnvironment();
+    if (env.isValid())
+        return env;
+
+    LanSegment saved;
+    saved.interfaceName = m_settings.value("network/lanInterface").toString();
+    saved.ip = m_settings.value("network/lanIp").toString();
+    saved.prefixLength = m_settings.value("network/lanPrefix", 0).toInt();
+    if (saved.isValid()) {
+        // Keep the choice if that address still exists on this machine; refresh
+        // the interface name in case the kernel renamed it.
+        for (const auto &s : LanSegments::enumerate()) {
+            if (s.ip == saved.ip && s.prefixLength == saved.prefixLength) {
+                saved.interfaceName = s.interfaceName;
+                return saved;
             }
         }
     }
-    return best.isEmpty() ? QStringLiteral("127.0.0.1") : best;
+    return LanSegments::preferred();
 }
+
+void Settings::setLanSegment(const LanSegment &segment) {
+    if (!segment.isValid())
+        return;
+    m_settings.setValue("network/lanInterface", segment.interfaceName);
+    m_settings.setValue("network/lanIp", segment.ip);
+    m_settings.setValue("network/lanPrefix", segment.prefixLength);
+    m_settings.sync();
+    emit changed();
+}
+
+QString Settings::lanIpAddress() const { return lanSegment().ip; }
 
 } // namespace meshlink
