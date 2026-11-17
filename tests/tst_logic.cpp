@@ -7,17 +7,20 @@
 #include "core/chunkplan.h"
 #include "core/crypto.h"
 #include "core/lansegment.h"
+#include "core/notifypolicy.h"
 #include "core/protocol.h"
 #include "core/storage.h"
+#include "core/account.h"
 
 #include <QByteArray>
-#include <QCoreApplication>
 #include <QDir>
+#include <QGuiApplication>
 #include <QHostAddress>
 #include <QSqlQuery>
 #include <QTemporaryDir>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 using namespace meshlink;
@@ -306,17 +309,249 @@ static int testRoomMigration() {
         stale.bindValue(0, oldRoom);
         CHECK(stale.exec());
         CHECK(stale.next() && stale.value(0).toInt() == 0);
+
+        // v3 migration adds reply/recall columns to pre-existing databases.
+        QSqlQuery info = storage.query("PRAGMA table_info(messages)");
+        CHECK(info.exec());
+        QStringList columns;
+        while (info.next())
+            columns << info.value(1).toString();
+        for (const QString &column : {QStringLiteral("reply_to"), QStringLiteral("recalled"),
+                                      QStringLiteral("recalled_by"), QStringLiteral("recalled_ts"),
+                                      QStringLiteral("recv_ts")})
+            CHECK(columns.contains(column));
+        storage.close();
+    }
+    return 0;
+}
+
+static int testRecallPolicy() {
+    const qint64 now = 1700000000000;
+    CHECK(canRecallMessage(MemberRole::Host, QStringLiteral("host"), QStringLiteral("other"),
+                           now - 9999999, now));
+    CHECK(canRecallMessage(MemberRole::Admin, QStringLiteral("admin"), QStringLiteral("other"),
+                           now - 9999999, now));
+    CHECK(canRecallMessage(MemberRole::Member, QStringLiteral("bob"), QStringLiteral("bob"),
+                           now - kSelfRecallWindowMs, now));
+    CHECK(!canRecallMessage(MemberRole::Member, QStringLiteral("bob"), QStringLiteral("bob"),
+                            now - kSelfRecallWindowMs - 1, now));
+    CHECK(!canRecallMessage(MemberRole::Member, QStringLiteral("bob"), QStringLiteral("alice"),
+                            now, now));
+    return 0;
+}
+
+static int testNotifyPolicy() {
+    namespace NP = meshlink::NotifyPolicy;
+    // ---- @-mention boundary matching ----
+    CHECK(NP::textMentions(QStringLiteral("@alice hi"), QStringLiteral("alice")));
+    CHECK(!NP::textMentions(QStringLiteral("@alicia hi"), QStringLiteral("alice")));
+    CHECK(!NP::textMentions(QStringLiteral("mail me at bob@example.com"), QStringLiteral("bob")));
+    CHECK(NP::textMentions(QStringLiteral("hey @Alice!"), QStringLiteral("alice"))); // case + boundary
+    CHECK(NP::textMentions(QStringLiteral("(@张三) 在吗"), QStringLiteral("张三")));
+    CHECK(!NP::textMentions(QStringLiteral("@张三丰 来了"), QStringLiteral("张三")));
+    CHECK(!NP::textMentions(QStringLiteral("plain text"), QStringLiteral("alice")));
+    CHECK(!NP::textMentions(QStringLiteral("@alice"), QString())); // empty nickname never matches
+
+    // ---- mention-all tokens ----
+    CHECK(NP::textMentionsAll(QStringLiteral("@all 开会")));
+    CHECK(NP::textMentionsAll(QStringLiteral("请 @所有人 关注")));
+    CHECK(NP::textMentionsAll(QStringLiteral("@全体成员 注意")));
+    CHECK(!NP::textMentionsAll(QStringLiteral("ball is round")));
+    CHECK(!NP::textMentionsAll(QStringLiteral("call it done"))); // "all" inside word
+
+    // ---- roster-based self mention ----
+    QVector<RoomMemberInfo> members;
+    RoomMemberInfo me;
+    me.fp = QStringLiteral("fp-me");
+    me.nickname = QStringLiteral("小明");
+    RoomMemberInfo other;
+    other.fp = QStringLiteral("fp-other");
+    other.nickname = QStringLiteral("小红");
+    members = {other, me};
+    CHECK(NP::textMentionsMe(QStringLiteral("@小明 在吗"), members, QStringLiteral("fp-me")));
+    CHECK(!NP::textMentionsMe(QStringLiteral("@小红 在吗"), members, QStringLiteral("fp-me")));
+    CHECK(!NP::textMentionsMe(QStringLiteral("@小明 在吗"), members, QStringLiteral("fp-other")));
+    CHECK(NP::textMentionsMe(QStringLiteral("@all 开会"), members, QStringLiteral("fp-other")));
+    CHECK(!NP::textMentionsMe(QStringLiteral("普通消息"), members, QStringLiteral("fp-me")));
+
+    // ---- notification decision matrix ----
+    NP::Context c;
+    c.globalEnabled = true;
+    c.windowActive = false;
+    c.viewingRoom = false;
+    c.roomDnd = false;
+    c.mentionsMe = false;
+    c.fromSelf = false;
+    CHECK(NP::decide(c) == NP::Action::Notify);
+    c.fromSelf = true;
+    CHECK(NP::decide(c) == NP::Action::Skip); // own echo never notifies
+    c.fromSelf = false;
+    c.windowActive = true;
+    c.viewingRoom = true;
+    CHECK(NP::decide(c) == NP::Action::Skip); // event already on screen
+    c.viewingRoom = false;
+    CHECK(NP::decide(c) == NP::Action::Notify); // other room while focused
+    c.roomDnd = true;
+    CHECK(NP::decide(c) == NP::Action::Skip); // muted room
+    c.mentionsMe = true;
+    CHECK(NP::decide(c) == NP::Action::Notify); // @-mention overrides DND
+    c.globalEnabled = false;
+    CHECK(NP::decide(c) == NP::Action::Skip); // master switch wins over mentions
+    return 0;
+}
+
+static int testAccountMulti() {
+    // Headless multi-account lifecycle against a redirected data home.
+    QTemporaryDir home;
+    CHECK(home.isValid());
+    qputenv("MESHLINK_DATA_HOME", home.path().toUtf8());
+    qputenv("MESHLINK_CONFIG_HOME", home.path().toUtf8());
+
+    Storage storage;
+    QString err;
+    CHECK(storage.open(home.filePath(QStringLiteral("multi.db")), &err));
+    AccountManager accounts(&storage);
+
+    CHECK(!accounts.hasAccount());
+    const qint64 first = accounts.createNewAccount(QStringLiteral("小明"), &err);
+    CHECK(first > 0);
+    CHECK(accounts.hasAccount());
+    CHECK(accounts.profile().valid);
+    CHECK(accounts.profile().fingerprint.size() == 32);
+    CHECK(accounts.profile().nickname == QStringLiteral("小明"));
+
+    const qint64 second = accounts.createNewAccount(QStringLiteral("小红"), &err);
+    CHECK(second > 0 && second != first);
+    CHECK(accounts.activeRowId() == second); // newly created account is active
+    CHECK(accounts.listAccounts().size() == 2);
+
+    // Switch back and forth; keystore decryption must round-trip.
+    CHECK(accounts.loadAccount(first, &err));
+    CHECK(accounts.profile().nickname == QStringLiteral("小明"));
+    CHECK(accounts.loadAccount(second, &err));
+    CHECK(accounts.profile().nickname == QStringLiteral("小红"));
+
+    // Deleting a non-active account keeps the active one intact.
+    if (!accounts.deleteAccount(first, true, &err)) {
+        std::fprintf(stderr, "deleteAccount failed: %s\n", qUtf8Printable(err));
+        return 1;
+    }
+    CHECK(accounts.listAccounts().size() == 1);
+    CHECK(accounts.profile().nickname == QStringLiteral("小红"));
+
+    // Destroying the last account leaves an empty, reusable database.
+    const int remaining = accounts.destroyAccount(true, &err);
+    CHECK(remaining == 0);
+    CHECK(!accounts.hasAccount());
+    CHECK(accounts.createNewAccount(QStringLiteral("小亮"), &err) > 0);
+    storage.close();
+    return 0;
+}
+
+static int testRoomPrefsMigration() {
+    // Legacy single-account database (account table CHECK(id=1), no owner_fp)
+    // must rebuild into the multi-account schema and backfill room ownership.
+    QTemporaryDir tmp;
+    CHECK(tmp.isValid());
+    const QString path = tmp.filePath(QStringLiteral("legacy-account.db"));
+    {
+        Storage storage;
+        QString err;
+        CHECK(storage.open(path, &err));
+        QSqlQuery drop = storage.query("DROP TABLE account");
+        CHECK(drop.exec());
+        // Recreate the 1.x account/profile tables exactly as the historical
+        // build created them: hard-wired id, NOT NULL identity material.
+        QSqlQuery legacy = storage.query(
+            "CREATE TABLE account (id INTEGER PRIMARY KEY CHECK(id=1), fingerprint TEXT NOT NULL, "
+            "nickname TEXT NOT NULL, ed25519_pub BLOB NOT NULL, x25519_pub BLOB NOT NULL, "
+            "keystore_blob BLOB NOT NULL, cert_pem TEXT NOT NULL, created_ts INTEGER NOT NULL)");
+        CHECK(legacy.exec());
+        QSqlQuery ins = storage.query(
+            "INSERT INTO account (id, fingerprint, nickname, ed25519_pub, x25519_pub, "
+            "keystore_blob, cert_pem, created_ts) VALUES (1, 'legacyfp', '旧用户', x'0031', "
+            "x'0032', x'0033', '-----BEGIN CERTIFICATE-----', 123)");
+        CHECK(ins.exec());
+        QSqlQuery dropProfile = storage.query("DROP TABLE profile");
+        CHECK(dropProfile.exec());
+        QSqlQuery legacyProfile = storage.query(
+            "CREATE TABLE profile (id INTEGER PRIMARY KEY CHECK(id = 1), avatar_path TEXT, "
+            "avatar_hash TEXT, lan_ip TEXT)");
+        CHECK(legacyProfile.exec());
+        QSqlQuery insProfile = storage.query(
+            "INSERT INTO profile (id, avatar_path, avatar_hash, lan_ip) VALUES (1, '', '', '')");
+        CHECK(insProfile.exec());
+        QSqlQuery legacyRoom = storage.query(
+            "INSERT INTO rooms (room_id,name,intro,policy,global_mute,capacity,host_fp,hosted,"
+            "joined,created_ts) VALUES ('0123456789abcdef0123456789abcdef', '旧房间', NULL, 0, 0, 0,"
+            " NULL, 1, 1, 1)");
+        CHECK(legacyRoom.exec());
+        storage.close();
+    }
+    {
+        Storage storage;
+        QString err;
+        if (!storage.open(path, &err)) { // migration runs here
+            std::fprintf(stderr, "reopen failed: %s\n", qUtf8Printable(err));
+            return 1;
+        }
+        QSqlQuery account = storage.query("SELECT id, fingerprint FROM account");
+        CHECK(account.exec());
+        CHECK(account.next());
+        CHECK(account.value(0).toLongLong() == 1);
+        CHECK(account.value(1).toString() == QStringLiteral("legacyfp"));
+
+        // Rooms created by the legacy account inherit its fingerprint as owner.
+        QSqlQuery room = storage.query("SELECT owner_fp FROM rooms");
+        CHECK(room.exec());
+        CHECK(room.next());
+        CHECK(room.value(0).toString() == QStringLiteral("legacyfp"));
+
+        // Per-room preference table exists and upserts cleanly.
+        QSqlQuery prefs = storage.query("SELECT COUNT(*) FROM room_prefs");
+        CHECK(prefs.exec());
+        CHECK(prefs.next() && prefs.value(0).toInt() == 0);
+        QSqlQuery upsert = storage.query(
+            "INSERT INTO room_prefs (room_id, dnd) VALUES ('0123456789abcdef0123456789abcdef', 1)"
+            " ON CONFLICT(room_id) DO UPDATE SET dnd = excluded.dnd");
+        CHECK(upsert.exec());
+        QSqlQuery check = storage.query(
+            "SELECT dnd FROM room_prefs WHERE room_id='0123456789abcdef0123456789abcdef'");
+        CHECK(check.exec());
+        CHECK(check.next() && check.value(0).toInt() == 1);
         storage.close();
     }
     return 0;
 }
 
 int main(int argc, char **argv) {
-    QCoreApplication app(argc, argv);
+    // QGuiApplication (offscreen in ctest) because account creation renders the
+    // default identicon avatar through QPainter/QPixmap.
+    std::fprintf(stderr, "tst_logic: pre-app\n");
+    QGuiApplication app(argc, argv);
+    std::fprintf(stderr, "tst_logic: post-app\n");
     app.setApplicationName(QStringLiteral("tst_logic"));
-    if (testFraming() || testSerializers() || testChunkPlan() || testCrypto() || testLanSegment() ||
-        testRoomMigration())
-        return 1;
+    struct Entry {
+        const char *name;
+        int (*fn)();
+    };
+    const Entry entries[] = {
+        {"framing", testFraming},       {"serializers", testSerializers},
+        {"chunkplan", testChunkPlan},   {"crypto", testCrypto},
+        {"lansegment", testLanSegment}, {"recall", testRecallPolicy},
+        {"notifypolicy", testNotifyPolicy}, {"account", testAccountMulti},
+        {"migration", testRoomMigration},   {"roomprefs", testRoomPrefsMigration},
+    };
+    if (argc > 1) { // debug helper: run a single suite only
+        for (const auto &e : entries) {
+            if (std::strcmp(argv[1], e.name) == 0)
+                return e.fn();
+        }
+        return 2;
+    }
+    for (const auto &e : entries)
+        if (e.fn())
+            return 1;
     std::printf("tst_logic: ALL OK (%d checks)\n", g_checks);
     return 0;
 }
