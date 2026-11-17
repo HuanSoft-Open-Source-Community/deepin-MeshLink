@@ -5,6 +5,8 @@ Maintainer: HuanSoft Open Source Community <yxzl666xx@outlook.com>
 Build-Depends: debhelper-compat (= 13),
                cmake,
                qt6-base-dev,
+               qt6-tools-dev,
+               qt6-l10n-tools,
                libdtk6core-dev,
                libdtk6gui-dev,
                libdtk6widget-dev,
@@ -18,7 +20,8 @@ Vcs-Browser: https://github.com/HuanSoft-Open-Source-Community/deepin-MeshLink
 Package: deepin-meshlink
 Architecture: any
 Depends: ${shlibs:Depends},
-         ${misc:Depends}
+         ${misc:Depends},
+         qt6-translations-l10n
 Description: decentralised LAN instant messenger (deepin-MeshLink)
  deepin-MeshLink (深度织讯) is a peer-to-peer instant-messaging client for
  deepin/UOS. Every node is also a server: nodes discover each other through
