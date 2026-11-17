@@ -1,0 +1,20 @@
+# deepin-MeshLink — fail the test when the shipped .ts contains unfinished or
+# vanished entries. SPDX-License-Identifier: GPL-3.0-or-later
+if(NOT DEFINED TS_FILE)
+    message(FATAL_ERROR "TS_FILE is required")
+endif()
+if(NOT EXISTS "${TS_FILE}")
+    message(FATAL_ERROR "translation file not found: ${TS_FILE}")
+endif()
+
+file(READ "${TS_FILE}" contents)
+if(NOT contents MATCHES "<message")
+    message(FATAL_ERROR "translation file contains no messages: ${TS_FILE}")
+endif()
+if(contents MATCHES "type=\"unfinished\"")
+    message(FATAL_ERROR "unfinished translations remain in ${TS_FILE}")
+endif()
+if(contents MATCHES "type=\"vanished\"")
+    message(FATAL_ERROR "vanished translations remain in ${TS_FILE}")
+endif()
+message(STATUS "translations: complete (${TS_FILE})")

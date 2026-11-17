@@ -55,7 +55,7 @@ QString RoomManager::createRoom(const QString &name, const QString &intro, JoinP
     const QString n = name.trimmed();
     if (n.length() < 2 || n.length() > 64) { // UC-05 step 2
         if (error)
-            *error = QStringLiteral("聊天室名称需为 2–64 个字符");
+            *error = tr("Room name must be 2–64 characters long");
         return {};
     }
     if (capacity < 0)
@@ -65,7 +65,7 @@ QString RoomManager::createRoom(const QString &name, const QString &intro, JoinP
     const QString inviteCode = generateInviteCode(m_storage);
     if (inviteCode.isEmpty()) {
         if (error)
-            *error = QStringLiteral("无法生成唯一邀请码，请稍后重试");
+            *error = tr("Could not generate a unique invite code; try again later");
         return {};
     }
     const QByteArray seed = (self + "|" + n + "|" + inviteCode + "|" + QString::number(ts)).toUtf8();
@@ -74,8 +74,8 @@ QString RoomManager::createRoom(const QString &name, const QString &intro, JoinP
             .substr(0, kRoomIdHexLen)
             .c_str());
 
-    QSqlQuery q = m_storage->query("INSERT INTO rooms (room_id,name,intro,invite_code,policy,global_mute,capacity,host_fp,hosted,joined,created_ts)"
-                                   " VALUES (?,?,?,?,?,0,?,?,1,1,?)");
+    QSqlQuery q = m_storage->query("INSERT INTO rooms (room_id,name,intro,invite_code,policy,global_mute,capacity,host_fp,hosted,joined,created_ts,owner_fp)"
+                                   " VALUES (?,?,?,?,?,0,?,?,1,1,?,?)");
     q.bindValue(0, roomId);
     q.bindValue(1, n);
     q.bindValue(2, intro.trimmed());
@@ -84,6 +84,7 @@ QString RoomManager::createRoom(const QString &name, const QString &intro, JoinP
     q.bindValue(5, capacity);
     q.bindValue(6, self);
     q.bindValue(7, ts);
+    q.bindValue(8, self); // multi-account: rooms belong to the creating identity
     if (!q.exec()) {
         if (error)
             *error = q.lastError().text();
@@ -111,7 +112,8 @@ QVector<RoomLocal> RoomManager::myRooms() const {
         "SELECT r.room_id,r.name,r.intro,r.invite_code,r.policy,r.global_mute,r.capacity,r.host_fp,r.hosted,r.joined,r.created_ts,"
         " (SELECT COUNT(*) FROM members m WHERE m.room_id=r.room_id),"
         " (SELECT m.nickname FROM members m WHERE m.room_id=r.room_id AND m.fingerprint=r.host_fp)"
-        " FROM rooms r WHERE r.joined=1 OR r.hosted=1 ORDER BY r.created_ts");
+        " FROM rooms r WHERE (r.joined=1 OR r.hosted=1) AND r.owner_fp=? ORDER BY r.created_ts");
+    q.bindValue(0, m_acct->profile().fingerprint);
     q.exec();
     while (q.next()) {
         RoomLocal r;
@@ -164,13 +166,32 @@ QVector<RoomMemberInfo> RoomManager::members(const QString &roomId) const {
 }
 
 MemberRole RoomManager::myRole(const QString &roomId) const {
+    return roleOf(roomId, m_acct->profile().fingerprint);
+}
+
+MemberRole RoomManager::roleOf(const QString &roomId, const QString &fingerprint) const {
     QSqlQuery q = m_storage->query("SELECT role FROM members WHERE room_id=? AND fingerprint=?");
     q.bindValue(0, roomId);
-    q.bindValue(1, m_acct->profile().fingerprint);
+    q.bindValue(1, fingerprint);
     q.exec();
     if (q.next())
         return static_cast<MemberRole>(q.value(0).toInt());
     return MemberRole::Member;
+}
+
+bool RoomManager::isModerator(const QString &roomId, const QString &fingerprint) const {
+    if (!room(roomId).joined)
+        return false;
+    const MemberRole role = roleOf(roomId, fingerprint);
+    return role == MemberRole::Host || role == MemberRole::Admin;
+}
+
+bool RoomManager::isMember(const QString &roomId, const QString &fingerprint) const {
+    QSqlQuery q = m_storage->query("SELECT 1 FROM members WHERE room_id=? AND fingerprint=?");
+    q.bindValue(0, roomId);
+    q.bindValue(1, fingerprint);
+    q.exec();
+    return q.next();
 }
 
 bool RoomManager::isMuted(const QString &roomId, qint64 *untilOut) const {
@@ -205,6 +226,25 @@ bool RoomManager::isMuted(const QString &roomId, qint64 *untilOut) const {
     return false;
 }
 
+// ---------------- per-room local preferences ----------------
+bool RoomManager::isRoomDnd(const QString &roomId) const {
+    QSqlQuery q = m_storage->query("SELECT dnd FROM room_prefs WHERE room_id=?");
+    q.bindValue(0, roomId);
+    q.exec();
+    return q.next() && q.value(0).toInt() != 0;
+}
+
+void RoomManager::setRoomDnd(const QString &roomId, bool dnd) {
+    QSqlQuery q = m_storage->query(
+        "INSERT INTO room_prefs (room_id,dnd) VALUES (?,?)"
+        " ON CONFLICT(room_id) DO UPDATE SET dnd=excluded.dnd");
+    q.bindValue(0, roomId);
+    q.bindValue(1, dnd ? 1 : 0);
+    q.exec();
+    emit roomDndChanged(roomId, dnd);
+    emit roomsChanged();
+}
+
 QVector<PendingJoin> RoomManager::pendingApprovals(const QString &roomId) const {
     QVector<PendingJoin> out;
     QSqlQuery q = m_storage->query("SELECT id,fingerprint,nickname,ip,port FROM approvals WHERE room_id=? ORDER BY req_ts");
@@ -236,7 +276,8 @@ QVector<QString> RoomManager::blacklist(const QString &roomId) const {
 QVector<RoomSummary> RoomManager::hostedSummaries() const {
     QVector<RoomSummary> out;
     QSqlQuery q = m_storage->query("SELECT r.room_id,r.name,r.invite_code,r.policy,(SELECT COUNT(*) FROM members m WHERE m.room_id=r.room_id)"
-                                   " FROM rooms r WHERE r.hosted=1");
+                                   " FROM rooms r WHERE r.hosted=1 AND r.owner_fp=?");
+    q.bindValue(0, m_acct->profile().fingerprint);
     q.exec();
     while (q.next()) {
         RoomSummary s;
@@ -256,7 +297,7 @@ void RoomManager::joinRoom(const RoomSummary &summary, JoinCb cb) {
     const QString hostFp = summary.hostFp;
     auto hostPeer = m_resolve ? m_resolve(hostFp) : std::nullopt;
     if (!hostPeer) { // UC-06 E1: host unreachable -> no half-joined state
-        cb(JoinStatus::RoomGone, QStringLiteral("聊天室暂时不可用（托管节点不在线）"));
+        cb(JoinStatus::RoomGone, tr("The room is unavailable (host offline)"));
         return;
     }
     m_pendingJoins[summary.roomId] = cb;
@@ -268,7 +309,7 @@ void RoomManager::joinRoom(const RoomSummary &summary, JoinCb cb) {
     if (!m_send(hostFp, MsgType::JoinRequest, j.toPayload())) {
         m_pendingJoins.remove(summary.roomId);
         m_pendingJoinHost.remove(summary.roomId);
-        cb(JoinStatus::RoomGone, QStringLiteral("聊天室暂时不可用")); // E1
+        cb(JoinStatus::RoomGone, tr("The room is unavailable")); // E1
     }
 }
 
@@ -305,7 +346,7 @@ void RoomManager::handleJoinRequest(SecureChannel *ch, const QByteArray &payload
     };
 
     if (!r.hosted || r.roomId.isEmpty()) {
-        respond(JoinStatus::RoomGone, QStringLiteral("聊天室不存在"));
+        respond(JoinStatus::RoomGone, tr("The room does not exist"));
         return;
     }
     // BR-14: blacklist blocks rejoin even with open policy.
@@ -319,7 +360,7 @@ void RoomManager::handleJoinRequest(SecureChannel *ch, const QByteArray &payload
             fprintf(stderr, "[room] blackgate room=%s fp=%s hit=%d\n", qUtf8Printable(req.roomId),
                     qUtf8Printable(req.fingerprint.left(8)), int(blacklisted));
         if (blacklisted) { // BR-14
-            respond(JoinStatus::Blacklisted, QStringLiteral("你已被该聊天室列入黑名单"));
+            respond(JoinStatus::Blacklisted, tr("You are blacklisted in this room"));
             return;
         }
     }
@@ -337,7 +378,7 @@ void RoomManager::handleJoinRequest(SecureChannel *ch, const QByteArray &payload
         cq.exec();
         cq.next();
         if (cq.value(0).toInt() >= r.capacity) { // UC-06 E2
-            respond(JoinStatus::RoomFull, QStringLiteral("聊天室已满"));
+            respond(JoinStatus::RoomFull, tr("The room is full"));
             return;
         }
     }
@@ -359,13 +400,13 @@ void RoomManager::handleJoinRequest(SecureChannel *ch, const QByteArray &payload
         p.requester.nickname = req.nickname;
         p.requester.ip = dialIp;
         p.requester.tcpPort = dialPort;
-        respond(JoinStatus::PendingApproval, QStringLiteral("申请已提交，等待托管者批准"));
+        respond(JoinStatus::PendingApproval, tr("Request submitted; waiting for the host to approve"));
         emit joinRequested(req.roomId, p);
         return;
     }
 
     upsertMember(req.roomId, req.fingerprint, req.nickname, static_cast<quint8>(MemberRole::Member));
-    respond(JoinStatus::Accepted, QStringLiteral("已加入"));
+    respond(JoinStatus::Accepted, tr("Joined"));
     sendSnapshotTo(req.fingerprint, req.roomId);
     MemberEventMsg ev;
     ev.roomId = req.roomId;
@@ -407,7 +448,7 @@ void RoomManager::respondApproval(qint64 rowId, bool accept) {
         emit membersChanged(roomId);
     } else {
         resp.status = static_cast<quint8>(JoinStatus::Denied);
-        resp.message = QStringLiteral("管理员拒绝了你的申请");
+        resp.message = tr("The host rejected the request");
         bytes = resp.toPayload();
     }
     QSqlQuery dq = m_storage->query("DELETE FROM approvals WHERE id=?");
@@ -443,7 +484,7 @@ void RoomManager::sendSnapshotTo(const QString &fp, const QString &roomId) {
     snap.members = members(roomId);
     snap.memberCount = snap.members.size();
     {
-        QSqlQuery q = m_storage->query("SELECT msg_id,sender_fp,sender_nick,avatar_hash,kind,seq,ts,text,content_hash,file_name,mime,file_size,img_w,img_h"
+        QSqlQuery q = m_storage->query("SELECT msg_id,sender_fp,sender_nick,avatar_hash,kind,seq,ts,text,content_hash,file_name,mime,file_size,img_w,img_h,reply_to,recalled,recalled_by,recalled_ts"
                                        " FROM messages WHERE room_id=? ORDER BY seq DESC LIMIT ?");
         q.bindValue(0, roomId);
         q.bindValue(1, m_settings->maxRoomHistory());
@@ -465,6 +506,10 @@ void RoomManager::sendSnapshotTo(const QString &fp, const QString &roomId) {
             m.fileSize = q.value(11).toLongLong();
             m.imgW = q.value(12).toInt();
             m.imgH = q.value(13).toInt();
+            m.replyTo = q.value(14).toString();
+            m.recalled = q.value(15).toInt() != 0;
+            m.recalledBy = q.value(16).toString();
+            m.recalledTs = q.value(17).toLongLong();
             m.status = static_cast<quint8>(MsgStatus::Delivered);
             snap.recent.prepend(m);
         }
@@ -521,8 +566,8 @@ void RoomManager::handleSnapshot(SecureChannel *ch, const QByteArray &payload) {
         return;
     }
     m_pendingJoinHost.remove(snap.roomId); // join handshake completed
-    QSqlQuery rq = m_storage->query("INSERT INTO rooms (room_id,name,intro,invite_code,policy,global_mute,capacity,host_fp,hosted,joined,created_ts)"
-                                    " VALUES (?,?,?,?,?,?,?,?,0,1,?) ON CONFLICT(room_id) DO UPDATE SET"
+    QSqlQuery rq = m_storage->query("INSERT INTO rooms (room_id,name,intro,invite_code,policy,global_mute,capacity,host_fp,hosted,joined,created_ts,owner_fp)"
+                                    " VALUES (?,?,?,?,?,?,?,?,0,1,?,?) ON CONFLICT(room_id) DO UPDATE SET"
                                     " name=excluded.name,intro=excluded.intro,invite_code=excluded.invite_code,"
                                     " policy=excluded.policy,global_mute=excluded.global_mute,"
                                     " capacity=excluded.capacity,joined=1");
@@ -535,6 +580,7 @@ void RoomManager::handleSnapshot(SecureChannel *ch, const QByteArray &payload) {
     rq.bindValue(6, snap.capacity);
     rq.bindValue(7, ch ? ch->peerFingerprint() : QString());
     rq.bindValue(8, nowMs());
+    rq.bindValue(9, m_acct->profile().fingerprint); // multi-account ownership
     rq.exec();
 
     // Replace member roster (authoritative snapshot, BR-12)
@@ -552,8 +598,8 @@ void RoomManager::handleSnapshot(SecureChannel *ch, const QByteArray &payload) {
         iq.exec();
     }
     for (const auto &m : snap.recent) {
-        QSqlQuery iq = m_storage->query("INSERT OR REPLACE INTO messages (msg_id,room_id,seq,sender_fp,sender_nick,avatar_hash,kind,ts,status,text,content_hash,file_name,mime,file_size,img_w,img_h)"
-                                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        QSqlQuery iq = m_storage->query("INSERT OR REPLACE INTO messages (msg_id,room_id,seq,sender_fp,sender_nick,avatar_hash,kind,ts,status,text,content_hash,file_name,mime,file_size,img_w,img_h,reply_to,recalled,recalled_by,recalled_ts,recv_ts)"
+                                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         iq.bindValue(0, m.msgId);
         iq.bindValue(1, snap.roomId);
         iq.bindValue(2, qlonglong(m.seq));
@@ -570,11 +616,16 @@ void RoomManager::handleSnapshot(SecureChannel *ch, const QByteArray &payload) {
         iq.bindValue(13, m.fileSize);
         iq.bindValue(14, m.imgW);
         iq.bindValue(15, m.imgH);
+        iq.bindValue(16, m.replyTo);
+        iq.bindValue(17, m.recalled ? 1 : 0);
+        iq.bindValue(18, m.recalledBy);
+        iq.bindValue(19, m.recalledTs);
+        iq.bindValue(20, 0);
         iq.exec();
     }
     emit membersChanged(snap.roomId);
     emit roomsChanged();
-    emit joinResult(snap.roomId, JoinStatus::Accepted, QStringLiteral("已加入"));
+    emit joinResult(snap.roomId, JoinStatus::Accepted, tr("Joined"));
 }
 
 // ---------------- UC-13 leave ----------------
@@ -592,7 +643,7 @@ void RoomManager::leaveRoom(const QString &roomId, std::function<void(bool, QStr
             q.exec();
         }
         emit roomsChanged();
-        cb(true, QStringLiteral("聊天室已关闭"));
+        cb(true, tr("The room has been closed"));
         return;
     }
     // send leave via TLS (UC-13 step 2)
@@ -627,7 +678,7 @@ bool RoomManager::canManage(const QString &roomId, const QString &actorFp, const
     aq.exec();
     if (!aq.next()) {
         if (why)
-            *why = QStringLiteral("操作者不是成员");
+            *why = tr("The actor is not a member");
         return false;
     }
     const auto actorRole = static_cast<MemberRole>(aq.value(0).toInt());
@@ -646,14 +697,14 @@ bool RoomManager::canManage(const QString &roomId, const QString &actorFp, const
     case AdminOp::GlobalMuteOff:
         if (actorRole != MemberRole::Host) {
             if (why)
-                *why = QStringLiteral("仅托管者可执行该操作"); // UC-07 table
+                *why = tr("Only the host may perform this action"); // UC-07 table
             return false;
         }
         break;
     default:
         if (actorRole == MemberRole::Member) {
             if (why)
-                *why = QStringLiteral("权限不足");
+                *why = tr("Insufficient permissions");
             return false;
         }
         break;
@@ -668,24 +719,24 @@ bool RoomManager::canManage(const QString &roomId, const QString &actorFp, const
         bl.exec();
         if (!bl.next()) {
             if (why)
-                *why = QStringLiteral("目标节点不在该聊天室中");
+                *why = tr("The target node is not in this room");
             return false;
         }
     }
     // BR-13: admins cannot operate on host or other admins; nobody operates on self for these.
     if (actorRole == MemberRole::Admin && (targetRole == MemberRole::Host || targetRole == MemberRole::Admin)) {
         if (why)
-            *why = QStringLiteral("管理员不可操作托管者或其他管理员"); // E1
+            *why = tr("An administrator cannot act on the host or another administrator"); // E1
         return false;
     }
     if (actorFp == targetFp && op != AdminOp::GlobalMuteOn && op != AdminOp::GlobalMuteOff) {
         if (why)
-            *why = QStringLiteral("不能对自己执行该操作");
+            *why = tr("You cannot perform this action on yourself");
         return false;
     }
     if (op == AdminOp::SetAdmin && targetRole == MemberRole::Host) {
         if (why)
-            *why = QStringLiteral("托管者无需设为管理员");
+            *why = tr("The host does not need to be made an administrator");
         return false;
     }
     return true;
@@ -943,7 +994,7 @@ void RoomManager::handle(MsgType type, SecureChannel *ch, const QByteArray &payl
             m.roomId = roomId;
             m.targetFp = fp;
             m.op = static_cast<quint8>(AdminOp::Kick);
-            m.reason = QStringLiteral("你已不再是该聊天室成员");
+            m.reason = tr("You are no longer a member of this room");
             ch->send(MsgType::MemberEvent, m.toPayload());
         }
         break;
@@ -986,7 +1037,7 @@ void RoomManager::handleMemberEvent(SecureChannel *ch, const QByteArray &payload
             QSqlQuery rq = m_storage->query("UPDATE rooms SET joined=0 WHERE room_id=?");
             rq.bindValue(0, m.roomId);
             rq.exec();
-            emit kickedFromRoom(m.roomId, m.reason.isEmpty() ? QStringLiteral("你已被移出聊天室") : m.reason);
+            emit kickedFromRoom(m.roomId, m.reason.isEmpty() ? tr("You were removed from the room") : m.reason);
             emit roomsChanged();
             return;
         }

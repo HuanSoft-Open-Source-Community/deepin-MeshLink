@@ -33,7 +33,7 @@ bool Discovery::start(QString *error) {
     // ReuseAddress lets multiple instances coexist during development/testing.
     if (!m_socket->bind(QHostAddress::Any, m_port, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
         if (error)
-            *error = QStringLiteral("UDP 端口 %1 绑定失败：%2（请在设置中修改发现端口）")
+            *error = tr("Could not bind UDP port %1: %2 (change the discovery port in Settings)")
                          .arg(m_port)
                          .arg(m_socket->errorString());
         delete m_socket;

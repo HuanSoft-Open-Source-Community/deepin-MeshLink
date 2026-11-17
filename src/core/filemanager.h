@@ -41,7 +41,8 @@ public:
     // UC-09: hash the file (streaming, pool thread), then announce via host.
     // cb(msgId_or_empty, error) — announced asynchronously; hash runs off-GUI.
     void announceFile(const QString &roomId, const QString &path,
-                      std::function<void(const QString &, const QString &)> cb);
+                      std::function<void(const QString &, const QString &)> cb,
+                      const QString &replyTo = {});
     // BR-18: completing a download makes us a supplier -> register with host.
     void registerAsSupplier(const QString &roomId, const QString &hash);
 
@@ -60,7 +61,8 @@ signals:
 
 private:
     void announceHashed(const QString &roomId, const QString &path, const QString &hash, const QString &name,
-                        qint64 size, const QString &mime, std::function<void(const QString &, const QString &)> cb);
+                        qint64 size, const QString &mime, std::function<void(const QString &, const QString &)> cb,
+                        const QString &replyTo);
     void hostReceiveAnnounce(const FileAnnounceMsg &fa, SecureChannel *ch);
     void respondSuppliers(SecureChannel *ch, const QString &hash);
     AccountManager *m_acct;

@@ -103,14 +103,14 @@ bool AccountManager::hasAccount() {
 }
 
 QString AccountManager::defaultNickname() {
-    return QStringLiteral("深度织讯用户_") + QString::fromLatin1(Crypto::randomHex(2).c_str()).toUpper();
+    return tr("deepin-MeshLink user_") + QString::fromLatin1(Crypto::randomHex(2).c_str()).toUpper();
 }
 
 bool AccountManager::validateNickname(const QString &nick, QString *why) {
     const int n = nick.trimmed().length();
     if (n < 2 || n > 32) {
         if (why)
-            *why = QStringLiteral("昵称长度需为 2–32 个字符");
+            *why = tr("Nickname must be 2–32 characters long");
         return false;
     }
     return true;
@@ -149,37 +149,55 @@ QPixmap AccountManager::makeIdenticon(const QString &seed, int size) {
     return QPixmap::fromImage(img);
 }
 
-bool AccountManager::createAccount(const QString &desiredNickname, QString *error) {
+QVector<AccountEntry> AccountManager::listAccounts() const {
+    QVector<AccountEntry> out;
+    QSqlQuery q = m_storage->query(
+        "SELECT a.id,a.fingerprint,a.nickname,a.created_ts,"
+        " COALESCE(p.avatar_hash,''),COALESCE(p.avatar_path,'')"
+        " FROM account a LEFT JOIN profile p ON p.account_id=a.id ORDER BY a.id");
+    q.exec();
+    while (q.next()) {
+        AccountEntry e;
+        e.id = q.value(0).toLongLong();
+        e.fingerprint = q.value(1).toString();
+        e.nickname = q.value(2).toString();
+        e.createdTs = q.value(3).toLongLong();
+        e.avatarHash = q.value(4).toString();
+        e.avatarPath = q.value(5).toString();
+        out.append(e);
+    }
+    return out;
+}
+
+qint64 AccountManager::createNewAccount(const QString &desiredNickname, QString *error) {
     Paths::ensureDirs();
-    if (hasAccount())
-        return loadAccount(error); // UC-01 A1: don't regenerate
 
     auto id = Crypto::generateIdentity();
     if (!id) {
         if (error)
-            *error = QStringLiteral("密钥生成失败"); // E1
-        return false;
+            *error = tr("Key generation failed"); // E1
+        return -1;
     }
     auto tls = Crypto::generateSelfSignedTls(id->fingerprint);
     if (!tls) {
         if (error)
-            *error = QStringLiteral("TLS 证书生成失败");
-        return false;
+            *error = tr("TLS certificate generation failed");
+        return -1;
     }
 
     Bytes priv = packPrivate(*id, *tls);
     Bytes blob = Crypto::aesGcmEncrypt(priv, kek());
     if (blob.empty()) {
         if (error)
-            *error = QStringLiteral("私钥加密失败");
-        return false;
+            *error = tr("Private key encryption failed");
+        return -1;
     }
 
     m_profile = Profile{};
     m_profile.fingerprint = QString::fromStdString(id->fingerprint);
     m_profile.nickname = desiredNickname.trimmed().isEmpty() ? defaultNickname() : desiredNickname.trimmed();
     if (!validateNickname(m_profile.nickname, error))
-        return false;
+        return -1;
     m_profile.ed25519Pub = QByteArray(reinterpret_cast<const char *>(id->ed25519Pub.data()), 32);
     m_profile.x25519Pub = QByteArray(reinterpret_cast<const char *>(id->x25519Pub.data()), 32);
     m_profile.tlsCertPem = QString::fromStdString(tls->certPem);
@@ -188,21 +206,8 @@ bool AccountManager::createAccount(const QString &desiredNickname, QString *erro
     m_tlsKeyPem = QString::fromStdString(tls->keyPem);
     m_profile.lanIp = Settings().lanIpAddress();
 
-    // default circular avatar derived from the fingerprint
-    QDir().mkpath(Paths::avatarDir());
-    m_profile.avatarPath = Paths::avatarDir() + "/current.png";
-    {
-        QPixmap pm = makeIdenticon(m_profile.fingerprint);
-        pm.save(m_profile.avatarPath, "PNG");
-        QFile f(m_profile.avatarPath);
-        if (f.open(QIODevice::ReadOnly)) {
-            const QByteArray d = f.readAll();
-            m_profile.avatarHash = QString::fromLatin1(Crypto::sha256Hex(reinterpret_cast<const uint8_t *>(d.data()), size_t(d.size())).c_str());
-        }
-    }
-
-    QSqlQuery q = m_storage->query("INSERT INTO account (id,fingerprint,nickname,ed25519_pub,x25519_pub,keystore_blob,cert_pem,created_ts)"
-                                   " VALUES (1,?,?,?,?,?,?,?)");
+    QSqlQuery q = m_storage->query("INSERT INTO account (fingerprint,nickname,ed25519_pub,x25519_pub,keystore_blob,cert_pem,created_ts)"
+                                   " VALUES (?,?,?,?,?,?,?)");
     q.bindValue(0, m_profile.fingerprint);
     q.bindValue(1, m_profile.nickname);
     q.bindValue(2, m_profile.ed25519Pub);
@@ -212,28 +217,52 @@ bool AccountManager::createAccount(const QString &desiredNickname, QString *erro
     q.bindValue(6, m_profile.createdTs);
     if (!q.exec()) {
         if (error)
-            *error = QStringLiteral("账号写入失败: %1").arg(q.lastError().text());
-        return false;
+            *error = tr("Could not write the account: %1").arg(q.lastError().text());
+        return -1;
     }
-    QSqlQuery pq = m_storage->query("INSERT OR REPLACE INTO profile (id,avatar_path,avatar_hash,lan_ip) VALUES (1,?,?,?)");
-    pq.bindValue(0, m_profile.avatarPath);
-    pq.bindValue(1, m_profile.avatarHash);
-    pq.bindValue(2, m_profile.lanIp);
+    const qint64 rowId = q.lastInsertId().toLongLong();
+    m_activeId = rowId;
+
+    // default circular avatar derived from the fingerprint; multi-account
+    // builds keep one avatar file per account (avatars/<id>.png).
+    QDir().mkpath(Paths::avatarDir());
+    m_profile.avatarPath = Paths::avatarDir() + QStringLiteral("/%1.png").arg(rowId);
+    {
+        QPixmap pm = makeIdenticon(m_profile.fingerprint);
+        pm.save(m_profile.avatarPath, "PNG");
+        QFile f(m_profile.avatarPath);
+        if (f.open(QIODevice::ReadOnly)) {
+            const QByteArray d = f.readAll();
+            m_profile.avatarHash = QString::fromLatin1(Crypto::sha256Hex(reinterpret_cast<const uint8_t *>(d.data()), size_t(d.size())).c_str());
+            // Publish to the blob cache: peers fetch avatars by hash (BR-06),
+            // and the local chat view also reads avatars from this cache.
+            QFile blob(Paths::blobDir() + "/" + m_profile.avatarHash);
+            if (blob.open(QIODevice::WriteOnly))
+                blob.write(d);
+        }
+    }
+
+    QSqlQuery pq = m_storage->query("INSERT OR REPLACE INTO profile (account_id,avatar_path,avatar_hash,lan_ip) VALUES (?,?,?,?)");
+    pq.bindValue(0, rowId);
+    pq.bindValue(1, m_profile.avatarPath);
+    pq.bindValue(2, m_profile.avatarHash);
+    pq.bindValue(3, m_profile.lanIp);
     pq.exec();
 
     m_profile.valid = true;
     emit profileChanged(m_profile);
-    return true;
+    return rowId;
 }
 
-bool AccountManager::loadAccount(QString *error) {
-    if (m_profile.valid)
+bool AccountManager::loadAccount(qint64 id, QString *error) {
+    if (m_profile.valid && m_activeId == id)
         return true;
-    QSqlQuery q = m_storage->query("SELECT fingerprint,nickname,ed25519_pub,x25519_pub,keystore_blob,cert_pem,created_ts FROM account WHERE id=1");
+    QSqlQuery q = m_storage->query("SELECT fingerprint,nickname,ed25519_pub,x25519_pub,keystore_blob,cert_pem,created_ts FROM account WHERE id=?");
+    q.bindValue(0, id);
     q.exec(); // Storage::query() only prepares: execute before reading rows
     if (!q.next()) {
         if (error)
-            *error = QStringLiteral("无账号");
+            *error = tr("No local account");
         return false;
     }
     Profile p;
@@ -250,22 +279,23 @@ bool AccountManager::loadAccount(QString *error) {
     auto plain = Crypto::aesGcmDecrypt(key, kek());
     if (!plain) {
         if (error)
-            *error = QStringLiteral("私钥解密失败（设备或凭据已变更）");
+            *error = tr("Private key decryption failed (device or credentials changed)");
         return false;
     }
-    Identity id;
+    Identity ident;
     std::string tlsKey;
-    id.ed25519Pub.assign(p.ed25519Pub.begin(), p.ed25519Pub.end());
-    id.x25519Pub.assign(p.x25519Pub.begin(), p.x25519Pub.end());
-    if (!unpackPrivate(*plain, id, tlsKey)) {
+    ident.ed25519Pub.assign(p.ed25519Pub.begin(), p.ed25519Pub.end());
+    ident.x25519Pub.assign(p.x25519Pub.begin(), p.x25519Pub.end());
+    if (!unpackPrivate(*plain, ident, tlsKey)) {
         if (error)
-            *error = QStringLiteral("密钥数据损坏");
+            *error = tr("Key material is corrupted");
         return false;
     }
-    m_edPriv = id.ed25519Priv;
+    m_edPriv = ident.ed25519Priv;
     m_tlsKeyPem = QString::fromStdString(tlsKey);
 
-    QSqlQuery pq = m_storage->query("SELECT avatar_path,avatar_hash,lan_ip FROM profile WHERE id=1");
+    QSqlQuery pq = m_storage->query("SELECT avatar_path,avatar_hash,lan_ip FROM profile WHERE account_id=?");
+    pq.bindValue(0, id);
     pq.exec();
     if (pq.next()) {
         p.avatarPath = pq.value(0).toString();
@@ -273,7 +303,31 @@ bool AccountManager::loadAccount(QString *error) {
         p.lanIp = pq.value(2).toString();
     }
     p.valid = true;
+    m_activeId = id;
     m_profile = p;
+    ensureAvatarLocation(id);
+
+    // Repair accounts created by older builds: the default avatar was saved
+    // under avatars/current.png but never published to blobs/<hash>.
+    if (!m_profile.avatarPath.isEmpty()) {
+        QFile af(m_profile.avatarPath);
+        if (af.open(QIODevice::ReadOnly)) {
+            const QByteArray d = af.readAll();
+            const QString hash = QString::fromLatin1(
+                Crypto::sha256Hex(reinterpret_cast<const uint8_t *>(d.data()), size_t(d.size())).c_str());
+            if (hash != m_profile.avatarHash) {
+                m_profile.avatarHash = hash;
+                QSqlQuery uq = m_storage->query("UPDATE profile SET avatar_hash=? WHERE account_id=?");
+                uq.bindValue(0, m_profile.avatarHash);
+                uq.bindValue(1, id);
+                uq.exec();
+            }
+            QFile blob(Paths::blobDir() + "/" + m_profile.avatarHash);
+            if (!blob.exists() && blob.open(QIODevice::WriteOnly))
+                blob.write(d);
+        }
+    }
+
     emit profileChanged(m_profile);
     return true;
 }
@@ -282,8 +336,9 @@ void AccountManager::setLanIp(const QString &ip) {
     if (m_profile.lanIp == ip)
         return;
     m_profile.lanIp = ip;
-    QSqlQuery q = m_storage->query("UPDATE profile SET lan_ip=? WHERE id=1");
+    QSqlQuery q = m_storage->query("UPDATE profile SET lan_ip=? WHERE account_id=?");
     q.bindValue(0, ip);
+    q.bindValue(1, m_activeId);
     q.exec();
     emit profileChanged(m_profile);
 }
@@ -297,7 +352,7 @@ bool AccountManager::updateProfile(const QString &nickname, const QString &avata
         QImage src(avatarSourcePath);
         if (src.isNull()) {
             if (error)
-                *error = QStringLiteral("头像图片无法读取");
+                *error = tr("The avatar image could not be read");
             return false;
         }
         // centre-crop to square, resize to 256, keep circular via identicon clip path style.
@@ -315,7 +370,7 @@ bool AccountManager::updateProfile(const QString &nickname, const QString &avata
         cp.drawImage(0, 0, cropped);
         cp.end();
         QDir().mkpath(Paths::avatarDir());
-        const QString dest = Paths::avatarDir() + "/current.png";
+        const QString dest = Paths::avatarDir() + QStringLiteral("/%1.png").arg(m_activeId);
         circular.save(dest, "PNG");
         QFile f(dest);
         if (f.open(QIODevice::ReadOnly)) {
@@ -331,40 +386,108 @@ bool AccountManager::updateProfile(const QString &nickname, const QString &avata
     }
 
     m_profile.nickname = nn;
-    QSqlQuery q = m_storage->query("UPDATE account SET nickname=? WHERE id=1");
+    QSqlQuery q = m_storage->query("UPDATE account SET nickname=? WHERE id=?");
     q.bindValue(0, nn);
+    q.bindValue(1, m_activeId);
     if (!q.exec()) {
         if (error)
             *error = q.lastError().text();
         return false;
     }
-    QSqlQuery pq = m_storage->query("UPDATE profile SET avatar_path=?,avatar_hash=? WHERE id=1");
+    QSqlQuery pq = m_storage->query("UPDATE profile SET avatar_path=?,avatar_hash=? WHERE account_id=?");
     pq.bindValue(0, m_profile.avatarPath);
     pq.bindValue(1, m_profile.avatarHash);
+    pq.bindValue(2, m_activeId);
     pq.exec();
     emit profileChanged(m_profile);
     return true;
 }
 
-bool AccountManager::destroyAccount(bool wipeHistoryAndFiles, QString *error) {
+void AccountManager::ensureAvatarLocation(qint64 id) {
+    const QString expected = Paths::avatarDir() + QStringLiteral("/%1.png").arg(id);
+    const QString legacy = Paths::avatarDir() + "/current.png";
+    if (m_profile.avatarPath == expected)
+        return;
+    QDir().mkpath(Paths::avatarDir());
+    // Migration: the single-account builds kept every avatar at current.png.
+    if (!QFile::exists(expected) && QFile::exists(legacy) && m_profile.avatarPath == legacy) {
+        if (QFile::rename(legacy, expected)) {
+            m_profile.avatarPath = expected;
+            QSqlQuery q = m_storage->query("UPDATE profile SET avatar_path=? WHERE account_id=?");
+            q.bindValue(0, expected);
+            q.bindValue(1, id);
+            q.exec();
+            return;
+        }
+    }
+    if (QFile::exists(expected)) {
+        m_profile.avatarPath = expected;
+        QSqlQuery q = m_storage->query("UPDATE profile SET avatar_path=? WHERE account_id=?");
+        q.bindValue(0, expected);
+        q.bindValue(1, id);
+        q.exec();
+    }
+}
+
+int AccountManager::destroyAccount(bool wipeHistoryAndFiles, QString *error) {
     // Step 5: securely overwrite the keystore material.
     // Private key lives only inside account.keystore_blob, so we zero that row.
-    QSqlQuery q = m_storage->query("UPDATE account SET keystore_blob=? WHERE id=1");
+    const QString fingerprint = m_profile.fingerprint;
+    QSqlQuery q = m_storage->query("UPDATE account SET keystore_blob=? WHERE id=?");
     q.bindValue(0, QByteArray(64, '\0'));
+    q.bindValue(1, m_activeId);
     q.exec();
     // wipe the on-disk salt so the (already randomised) blob is unrecoverable
     QFile::remove(Paths::keystoreSalt());
 
     // Step 6/5: remove identity + (optionally) session data.
-    if (!m_storage->wipeAccount(m_profile.fingerprint, wipeHistoryAndFiles, error))
-        return false;
+    if (!m_storage->wipeAccount(fingerprint, wipeHistoryAndFiles, error))
+        return -1;
 
-    // remove avatar cache
-    QFile::remove(Paths::avatarDir() + "/current.png");
+    // remove the avatar cache of the destroyed account
+    if (!m_profile.avatarPath.isEmpty())
+        QFile::remove(m_profile.avatarPath);
 
     m_profile = Profile{};
+    m_activeId = 0;
     m_edPriv.clear();
     m_tlsKeyPem.clear();
+    return listAccounts().size();
+}
+
+bool AccountManager::deleteAccount(qint64 id, bool wipeHistoryAndFiles, QString *error) {
+    QSqlQuery q = m_storage->query("SELECT fingerprint FROM account WHERE id=?");
+    q.bindValue(0, id);
+    q.exec();
+    if (!q.next()) {
+        if (error)
+            *error = tr("No local account");
+        return false;
+    }
+    const QString fingerprint = q.value(0).toString();
+
+    QSqlQuery zero = m_storage->query("UPDATE account SET keystore_blob=? WHERE id=?");
+    zero.bindValue(0, QByteArray(64, '\0'));
+    zero.bindValue(1, id);
+    zero.exec();
+
+    QString avatarPath;
+    QSqlQuery pq = m_storage->query("SELECT avatar_path FROM profile WHERE account_id=?");
+    pq.bindValue(0, id);
+    pq.exec();
+    if (pq.next())
+        avatarPath = pq.value(0).toString();
+
+    if (!m_storage->wipeAccount(fingerprint, wipeHistoryAndFiles, error))
+        return false;
+    if (!avatarPath.isEmpty())
+        QFile::remove(avatarPath);
+    if (m_activeId == id) {
+        m_profile = Profile{};
+        m_activeId = 0;
+        m_edPriv.clear();
+        m_tlsKeyPem.clear();
+    }
     return true;
 }
 

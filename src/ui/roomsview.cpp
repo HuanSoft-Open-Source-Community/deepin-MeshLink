@@ -6,339 +6,691 @@
 #include "chatview.h"
 #include "core/engine.h"
 #include "core/roommanager.h"
-#include "core/settings.h"
+#include "uiutils.h"
 
+#include <DComboBox>
 #include <DDialog>
+#include <DFrame>
+#include <DFontSizeManager>
+#include <DIconButton>
+#include <DLabel>
+#include <DLineEdit>
+#include <DListView>
+#include <DPushButton>
+#include <DSpinBox>
+#include <DStandardItem>
+#include <DStyledItemDelegate>
+#include <DSuggestButton>
+#include <DWarningButton>
+#include <dinputdialog.h>
 
-#include <QComboBox>
-#include <QDateTime>
+#include <QCursor>
 #include <QDialog>
-#include <QFileDialog>
+#include <QFormLayout>
+#include <QClipboard>
+#include <QGuiApplication>
 #include <QHBoxLayout>
-#include <QInputDialog>
-#include <QLabel>
-#include <QLineEdit>
-#include <QListWidget>
+#include <QItemSelectionModel>
 #include <QMenu>
-#include <QMessageBox>
 #include <QPointer>
-#include <QPushButton>
-#include <QSpinBox>
 #include <QSplitter>
+#include <QStandardItemModel>
+#include <QTabWidget>
+#include <QTimer>
 #include <QVBoxLayout>
 
 DWIDGET_USE_NAMESPACE
+DGUI_USE_NAMESPACE
 
 namespace meshlink {
+namespace {
+
+// Keep conversation rows compact regardless of translated text length.
+class RoomDelegate : public DTK_WIDGET_NAMESPACE::DStyledItemDelegate {
+public:
+    using DStyledItemDelegate::DStyledItemDelegate;
+    QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override {
+        QSize size = DStyledItemDelegate::sizeHint(option, index);
+        size.setHeight(52);
+        return size;
+    }
+};
+
+} // namespace
 
 RoomsView::RoomsView(Engine *engine, QWidget *parent) : QWidget(parent), m_engine(engine) {
-    auto *split = new QSplitter(this);
-    auto *left = new QWidget(split);
-    auto *lly = new QVBoxLayout(left);
-    lly->setContentsMargins(6, 6, 6, 6);
+    auto *root = new QVBoxLayout(this);
+    root->setContentsMargins(24, 20, 24, 20);
+    root->setSpacing(16);
 
-    auto *btnRow = new QHBoxLayout;
-    auto *create = new QPushButton(QStringLiteral("新建聊天室"), left);
-    create->setToolTip(QStringLiteral("UC-05"));
-    connect(create, &QPushButton::clicked, this, &RoomsView::openCreateDialog);
-    auto *browse = new QPushButton(QStringLiteral("发现房间"), left);
-    connect(browse, &QPushButton::clicked, this, [this] { m_roomList->setFocus(); });
-    btnRow->addWidget(create);
-    lly->addLayout(btnRow);
+    auto *newRoom = new DSuggestButton(tr("New room"), this);
+    newRoom->setObjectName(QStringLiteral("roomsView.createRoomButton"));
+    newRoom->setIcon(UiUtils::icon(QStringLiteral("list-add")));
+    connect(newRoom, &DSuggestButton::clicked, this, &RoomsView::openCreateDialog);
+    root->addWidget(UiUtils::pageHeader(tr("Chats"), newRoom, this));
 
-    m_roomList = new QListWidget(left);
-    m_roomList->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(m_roomList, &QListWidget::currentRowChanged, this, [this](int) {
-        const int row = m_roomList->currentRow();
-        m_chat->setRoom(row < 0 ? QString() : m_roomList->item(row)->data(Qt::UserRole).toString());
-    });
-    connect(m_roomList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *it) {
-        openManagementDialog(it->data(Qt::UserRole).toString());
-    });
-    lly->addWidget(m_roomList, 1);
-    split->addWidget(left);
+    auto *split = new QSplitter(Qt::Horizontal, this);
+    split->setChildrenCollapsible(false);
+    split->setHandleWidth(1);
+
+    auto *leftContainer = new QWidget(split);
+    auto *leftContainerLayout = new QHBoxLayout(leftContainer);
+    leftContainerLayout->setContentsMargins(0, 0, 0, 0);
+    leftContainerLayout->setSpacing(0);
+
+    auto *left = new QWidget(leftContainer);
+    auto *leftLayout = new QVBoxLayout(left);
+    leftLayout->setContentsMargins(0, 0, 0, 0);
+    leftLayout->setSpacing(8);
+
+    m_emptyLabel = new DLabel(tr("No rooms yet. Create one, or discover rooms on your LAN."), left);
+    m_emptyLabel->setWordWrap(true);
+    m_emptyLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    m_emptyLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    m_emptyLabel->setForegroundRole(DPalette::TextTips);
+    leftLayout->addWidget(m_emptyLabel, 0, Qt::AlignTop);
+
+    m_roomList = new DListView(left);
+    m_roomList->setObjectName(QStringLiteral("roomsView.roomList"));
+    m_roomList->setFrameShape(QFrame::NoFrame);
+    m_roomList->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_roomList->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_roomList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_roomList->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    m_roomList->setBackgroundType(DStyledItemDelegate::RoundedBackground);
+    m_roomList->setItemMargins(QMargins(6, 2, 6, 2));
+    m_roomList->setItemSpacing(2);
+    m_roomList->setItemRadius(8);
+    m_roomList->setIconSize(QSize(24, 24));
+    m_roomList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_roomList->setItemDelegate(new RoomDelegate(m_roomList));
+    m_roomList->setMinimumWidth(220);
+    m_roomList->setMaximumWidth(300);
+    m_roomModel = new QStandardItemModel(this);
+    m_roomList->setModel(m_roomModel);
+    leftLayout->addWidget(m_roomList, 1);
 
     m_chat = new ChatView(m_engine, split);
     connect(m_chat, &ChatView::downloadsStarted, this, &RoomsView::downloadsStarted);
+    connect(m_chat, &ChatView::manageRequested, this, &RoomsView::openManagementDialog);
+
+    leftContainerLayout->addWidget(left, 1);
+    leftContainerLayout->addWidget(new DVerticalLine(leftContainer));
+
+    split->addWidget(leftContainer);
     split->addWidget(m_chat);
-    split->setSizes({240, 640});
+    split->setStretchFactor(0, 0);
+    split->setStretchFactor(1, 1);
+    split->setSizes({240, 760});
+    root->addWidget(split, 1);
 
-    auto *rootly = new QHBoxLayout(this);
-    rootly->setContentsMargins(0, 0, 0, 0);
-    rootly->addWidget(split);
+    connect(m_roomList->selectionModel(), &QItemSelectionModel::currentChanged, this,
+            [this](const QModelIndex &current, const QModelIndex &) {
+                const QString roomId =
+                    current.isValid() ? current.data(Qt::UserRole).toString() : QString();
+                m_chat->setRoom(roomId);
+                if (!roomId.isEmpty())
+                    emit roomActivated(roomId);
+            });
+    // Room-level actions (manage / mute / copy identifiers) live in the
+    // context menu to keep the rows clean.
+    m_roomList->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_roomList, &DListView::customContextMenuRequested, this,
+            [this](const QPoint &pos) {
+                const QModelIndex index = m_roomList->indexAt(pos);
+                const QString roomId =
+                    index.isValid() ? index.data(Qt::UserRole).toString() : QString();
+                if (!roomId.isEmpty() && index != m_roomList->currentIndex())
+                    selectRoom(roomId);
+                showRoomContextMenu(m_roomList->mapToGlobal(pos), roomId);
+            });
+    connect(m_roomList, &DListView::doubleClicked, this, [this](const QModelIndex &index) {
+        const QString roomId = index.data(Qt::UserRole).toString();
+        if (!roomId.isEmpty())
+            openManagementDialog(roomId);
+    });
 
-    connect(m_engine->rooms(), &RoomManager::roomsChanged, this, &RoomsView::refreshRooms);
-    connect(m_engine->rooms(), &RoomManager::kickedFromRoom, this, [this](const QString &roomId, const QString &reason) {
+    auto *rooms = m_engine->rooms();
+    connect(rooms, &RoomManager::roomsChanged, this, &RoomsView::refreshRooms);
+    connect(rooms, &RoomManager::kickedFromRoom, this,
+            [this](const QString &roomId, const QString &reason) {
+                if (currentRoomId() == roomId)
+                    m_chat->setRoom(QString());
+                refreshRooms();
+                UiUtils::warning(this, tr("Room"),
+                                 tr("You were removed from the room: %1").arg(reason));
+            });
+    connect(rooms, &RoomManager::roomClosedByHost, this, [this](const QString &roomId) {
+        if (currentRoomId() == roomId)
+            m_chat->setRoom(QString());
         refreshRooms();
-        if (m_chat)
-            m_chat->setRoom(m_roomList->currentRow() < 0 ? QString() : m_roomList->item(m_roomList->currentRow())->data(Qt::UserRole).toString());
-        QMessageBox::warning(this, QStringLiteral("聊天室"),
-                             QStringLiteral("你已被移出聊天室：%1").arg(reason)); // UC-07 踢出/黑名单反馈
+        UiUtils::info(this, tr("Room"),
+                      tr("The host dissolved this room. Local room records were removed."));
     });
-    connect(m_engine->rooms(), &RoomManager::roomClosedByHost, this, [this](const QString &) {
-        refreshRooms();
-        QMessageBox::information(this, QStringLiteral("聊天室"), QStringLiteral("托管者已解散该聊天室，本地记录已清理。")); // UC-13/UC-05
-    });
-    connect(m_engine->rooms(), &RoomManager::joinRequested, this, [this](const QString &roomId, const PendingJoin &) {
-        refreshRooms(); // badge 角标提示待批准（host UI）
-    });
-    connect(m_engine->rooms(), &RoomManager::joinResult, this, [this](const QString &, JoinStatus st, const QString &detail) {
-        if (st == JoinStatus::Accepted)
-            QMessageBox::information(this, QStringLiteral("加入聊天室"), QStringLiteral("已成功加入。"));
-        else if (st == JoinStatus::PendingApproval)
-            QMessageBox::information(this, QStringLiteral("加入聊天室"), QStringLiteral("申请已提交，等待托管者批准。"));
-        else
-            QMessageBox::warning(this, QStringLiteral("加入聊天室"), QStringLiteral("未能加入：%1").arg(detail));
-        refreshRooms();
-    });
+    connect(rooms, &RoomManager::joinRequested, this,
+            [this](const QString &, const PendingJoin &) { refreshRooms(); });
+    connect(rooms, &RoomManager::joinResult, this,
+            [this](const QString &roomId, JoinStatus status, const QString &) {
+                if (status == JoinStatus::Accepted || status == JoinStatus::PendingApproval)
+                    UiUtils::info(this, tr("Join room"), UiUtils::joinStatusText(status));
+                else
+                    UiUtils::warning(this, tr("Join room"), UiUtils::joinStatusText(status));
+                if (!roomId.isEmpty())
+                    refreshRooms();
+            });
+
     refreshRooms();
 }
 
-void RoomsView::refreshRooms() {
-    const int keep = m_roomList->currentRow();
-    const QString keepId = keep >= 0 && m_roomList->item(keep) ? m_roomList->item(keep)->data(Qt::UserRole).toString() : QString();
-    m_roomList->clear();
-    for (const auto &r : m_engine->rooms()->myRooms()) {
-        int pend = 0;
-        for (const auto &p : m_engine->rooms()->pendingApprovals(r.roomId))
-            ++pend;
-        auto *it = new QListWidgetItem(QStringLiteral("%1%2%3").arg(r.name,
-                                                                     r.hosted ? QStringLiteral(" ★") : QString(),
-                                                                     pend > 0 ? QStringLiteral(" ⚑%1").arg(pend) : QString()),
-                                       m_roomList);
-        it->setData(Qt::UserRole, r.roomId);
-        it->setToolTip(QStringLiteral("邀请码：%1\n房间指纹：%2").arg(r.inviteCode, r.roomId));
-        if (r.roomId == keepId)
-            m_roomList->setCurrentItem(it);
+QString RoomsView::currentRoomId() const {
+    const QModelIndex index = m_roomList ? m_roomList->currentIndex() : QModelIndex();
+    return index.isValid() ? index.data(Qt::UserRole).toString() : QString();
+}
+
+void RoomsView::selectRoom(const QString &roomId) {
+    if (roomId.isEmpty() || !m_roomModel)
+        return;
+    for (int row = 0; row < m_roomModel->rowCount(); ++row) {
+        if (m_roomModel->index(row, 0).data(Qt::UserRole).toString() == roomId) {
+            m_roomList->setCurrentIndex(m_roomModel->index(row, 0));
+            return;
+        }
     }
-    if (m_roomList->count() && !m_roomList->currentItem())
-        m_roomList->setCurrentRow(0);
+    // Room not rendered yet (roomsChanged is async): remember and apply on the
+    // next refresh.
+    m_pendingSelection = roomId;
+}
+
+void RoomsView::setMentionCounts(const QHash<QString, int> &counts) {
+    m_mentions = counts;
+    refreshRooms();
+}
+
+void RoomsView::showRoomContextMenu(const QPoint &globalPos, const QString &roomId) {
+    if (roomId.isEmpty())
+        return;
+    const RoomLocal room = m_engine->rooms()->room(roomId);
+    if (room.roomId.isEmpty())
+        return;
+    QMenu menu(this);
+    QAction *manage = menu.addAction(tr("Manage room…"));
+    QAction *copyCode = menu.addAction(tr("Copy invite code"));
+    QAction *copyFp = menu.addAction(tr("Copy room fingerprint"));
+    menu.addSeparator();
+    const bool dnd = m_engine->rooms()->isRoomDnd(roomId);
+    QAction *dndAction = menu.addAction(dnd ? tr("Notifications: muted")
+                                            : tr("Notifications: on"));
+    dndAction->setCheckable(true);
+    dndAction->setChecked(dnd);
+
+    QAction *chosen = menu.exec(globalPos);
+    if (!chosen)
+        return;
+    if (chosen == manage) {
+        openManagementDialog(roomId);
+    } else if (chosen == copyCode) {
+        QGuiApplication::clipboard()->setText(room.inviteCode);
+    } else if (chosen == copyFp) {
+        QGuiApplication::clipboard()->setText(room.roomId);
+    } else if (chosen == dndAction) {
+        m_engine->rooms()->setRoomDnd(roomId, !dnd);
+    }
+}
+
+void RoomsView::refreshRooms() {
+    if (!m_roomList || !m_roomModel)
+        return;
+    const QString keep = currentRoomId();
+    m_roomModel->clear();
+
+    const QVector<RoomLocal> rooms = m_engine->rooms()->myRooms();
+    int selected = -1;
+    for (int row = 0; row < rooms.size(); ++row) {
+        const RoomLocal &room = rooms.at(row);
+        int pending = 0;
+        for (const PendingJoin &join : m_engine->rooms()->pendingApprovals(room.roomId)) {
+            Q_UNUSED(join);
+            ++pending;
+        }
+
+        auto *item = new DStandardItem(room.name);
+        item->setData(room.roomId, Qt::UserRole);
+        item->setFontSize(DFontSizeManager::T8);
+        item->setToolTip(tr("Invite code: %1\nRoom fingerprint: %2")
+                             .arg(room.inviteCode, room.roomId));
+        if (room.hosted)
+            item->setIcon(UiUtils::icon(QStringLiteral("emblem-favorite"),
+                                        QStringLiteral("starred")));
+
+        QStringList meta;
+        meta << (room.hosted ? tr("Hosted") : tr("Member"));
+        meta << tr("Members: %1").arg(m_engine->rooms()->members(room.roomId).size());
+        if (pending > 0)
+            meta << tr("Pending: %1").arg(pending);
+
+        auto *subtitle = new DViewItemAction(Qt::AlignLeft, QSize(0, 0), QSize(), false);
+        subtitle->setText(meta.join(QStringLiteral(" · ")));
+        subtitle->setFontSize(DFontSizeManager::T8);
+        subtitle->setTextColorRole(DPalette::TextTips);
+        QList<DViewItemAction *> actions{subtitle};
+
+        // Row badges: unread @-mentions (warning colour) and the per-room
+        // do-not-disturb state, both right-aligned.
+        const int mentions = m_mentions.value(room.roomId, 0);
+        if (mentions > 0) {
+            auto *badge = new DViewItemAction(Qt::AlignRight, QSize(0, 0), QSize(), false);
+            badge->setText(tr("@%1").arg(mentions));
+            badge->setFontSize(DFontSizeManager::T8);
+            badge->setTextColorRole(DPalette::TextWarning);
+            actions.append(badge);
+        }
+        if (m_engine->rooms()->isRoomDnd(room.roomId)) {
+            auto *dnd = new DViewItemAction(Qt::AlignRight, QSize(0, 0), QSize(), false);
+            dnd->setIcon(UiUtils::icon(QStringLiteral("notifications-disabled"),
+                                       QStringLiteral("notification-disabled")));
+            dnd->setToolTip(tr("Notifications muted for this room"));
+            actions.append(dnd);
+        }
+        item->setTextActionList(actions);
+
+        m_roomModel->appendRow(item);
+        if (room.roomId == keep)
+            selected = row;
+    }
+
+    const bool empty = m_roomModel->rowCount() == 0;
+    m_emptyLabel->setVisible(empty);
+    m_roomList->setVisible(!empty);
+    if (empty) {
+        m_chat->setRoom(QString());
+        return;
+    }
+
+    if (selected < 0 && !m_pendingSelection.isEmpty()) {
+        for (int row = 0; row < rooms.size(); ++row) {
+            if (rooms.at(row).roomId == m_pendingSelection) {
+                selected = row;
+                break;
+            }
+        }
+    }
+    m_pendingSelection.clear();
+    if (selected < 0)
+        selected = 0;
+    m_roomList->setCurrentIndex(m_roomModel->index(selected, 0));
 }
 
 // ---- UC-05: create dialog ----
 void RoomsView::openCreateDialog() {
-    QDialog dlg(this);
-    dlg.setWindowTitle(QStringLiteral("新建聊天室（UC-05）"));
-    auto *form = new QVBoxLayout(&dlg);
-    auto *name = new QLineEdit(&dlg);
-    name->setPlaceholderText(QStringLiteral("房间名称（2–64 字符）"));
-    auto *intro = new QLineEdit(&dlg);
-    intro->setPlaceholderText(QStringLiteral("简介（可选）"));
-    auto *policy = new QComboBox(&dlg);
-    policy->addItem(QStringLiteral("自由加入"), int(JoinPolicy::Open));
-    policy->addItem(QStringLiteral("需托管者批准"), int(JoinPolicy::Approval)); // UC-06 A1
-    auto *cap = new QSpinBox(&dlg);
-    cap->setRange(0, 10000);
-    cap->setSpecialValueText(QStringLiteral("不限制"));
-    cap->setSuffix(QStringLiteral(" 人"));
-    form->addWidget(new QLabel(QStringLiteral("名称："), &dlg));
-    form->addWidget(name);
-    form->addWidget(new QLabel(QStringLiteral("简介："), &dlg));
-    form->addWidget(intro);
-    form->addWidget(new QLabel(QStringLiteral("加入策略："), &dlg));
-    form->addWidget(policy);
-    form->addWidget(new QLabel(QStringLiteral("容量上限："), &dlg));
-    form->addWidget(cap);
-    auto *bb = new QHBoxLayout;
-    auto *ok = new QPushButton(QStringLiteral("创建"), &dlg);
-    auto *cancel = new QPushButton(QStringLiteral("取消"), &dlg);
-    bb->addStretch();
-    bb->addWidget(ok);
-    bb->addWidget(cancel);
-    form->addLayout(bb);
-    connect(cancel, &QPushButton::clicked, &dlg, &QDialog::reject);
-    connect(ok, &QPushButton::clicked, &dlg, [&] {
-        QString err;
-        // roomId = SHA256(host|name|inviteCode|ts)[0:32] + unique 6-digit invite code
-        const QString id = m_engine->rooms()->createRoom(name->text(), intro->text(),
-                                                         JoinPolicy(policy->currentData().toInt()), cap->value(), &err);
+    DDialog dialog(this);
+    dialog.setTitle(tr("New room"));
+    dialog.setIcon(UiUtils::icon(QStringLiteral("list-add")));
+
+    auto *content = new QWidget(&dialog);
+    auto *form = new QFormLayout(content);
+    form->setContentsMargins(0, 0, 0, 0);
+    form->setSpacing(12);
+
+    auto *name = new DLineEdit(content);
+    name->setPlaceholderText(tr("Room name (2–64 characters)"));
+    name->lineEdit()->setMaxLength(64);
+    auto *intro = new DLineEdit(content);
+    intro->setPlaceholderText(tr("Description (optional)"));
+    intro->lineEdit()->setMaxLength(200);
+
+    auto *policy = new DComboBox(content);
+    policy->addItem(tr("Open to everyone"), int(JoinPolicy::Open));
+    policy->addItem(tr("Requires host approval"), int(JoinPolicy::Approval));
+
+    auto *capacity = new DSpinBox(content);
+    capacity->setRange(0, 10000);
+    capacity->setSpecialValueText(tr("No limit"));
+    capacity->setSuffix(tr(" people"));
+
+    form->addRow(tr("Name"), name);
+    form->addRow(tr("Description"), intro);
+    form->addRow(tr("Join policy"), policy);
+    form->addRow(tr("Capacity"), capacity);
+    content->setMinimumWidth(400);
+    dialog.addContent(content);
+
+    dialog.addButton(tr("Cancel"));
+    dialog.addButton(tr("Create"), true, DDialog::ButtonRecommend);
+    connect(&dialog, &DDialog::buttonClicked, this, [&](int index, const QString &) {
+        if (index != 1)
+            return;
+        QString error;
+        const QString id = m_engine->rooms()->createRoom(
+            name->text(), intro->text(), JoinPolicy(policy->currentData().toInt()),
+            capacity->value(), &error);
         if (id.isEmpty()) {
-            QMessageBox::warning(&dlg, QStringLiteral("创建失败"), err); // E1 name rules
+            if (error.isEmpty())
+                error = tr("Could not create the room.");
+            name->setAlert(true);
+            name->showAlertMessage(error);
             return;
         }
-        dlg.accept();
+
+        dialog.accept();
         refreshRooms();
         const RoomLocal created = m_engine->rooms()->room(id);
-        QMessageBox::information(this, QStringLiteral("聊天室已创建"),
-                                 QStringLiteral("邀请码：%1\n房间指纹：%2\n\n同一网段的成员可输入邀请码加入。")
-                                     .arg(created.inviteCode, created.roomId));
+        QTimer::singleShot(0, this, [this, created] {
+            DDialog info(this);
+            info.setTitle(tr("Room created"));
+            info.setMessage(tr("Share the invite code with people on the same LAN segment."));
+            info.setIcon(UiUtils::icon(QStringLiteral("dialog-information")));
+
+            auto *box = new QWidget(&info);
+            auto *form = new QFormLayout(box);
+            form->setContentsMargins(0, 0, 0, 0);
+            form->setSpacing(10);
+
+            auto *code = new DLineEdit(box);
+            code->lineEdit()->setReadOnly(true);
+            code->setText(created.inviteCode);
+            auto *copyCode = new DIconButton(box);
+            copyCode->setIcon(UiUtils::icon(QStringLiteral("edit-copy")));
+            copyCode->setFlat(true);
+            connect(copyCode, &DIconButton::clicked, &info, [&info, created] {
+                QGuiApplication::clipboard()->setText(created.inviteCode);
+                info.setMessage(tr("Invite code copied to the clipboard."));
+            });
+            code->setRightWidgets({copyCode});
+
+            auto *fingerprint = new DLineEdit(box);
+            fingerprint->lineEdit()->setReadOnly(true);
+            fingerprint->setText(created.roomId);
+            auto *copyFingerprint = new DIconButton(box);
+            copyFingerprint->setIcon(UiUtils::icon(QStringLiteral("edit-copy")));
+            copyFingerprint->setFlat(true);
+            connect(copyFingerprint, &DIconButton::clicked, &info, [&info, created] {
+                QGuiApplication::clipboard()->setText(created.roomId);
+                info.setMessage(tr("Room fingerprint copied to the clipboard."));
+            });
+            fingerprint->setRightWidgets({copyFingerprint});
+
+            form->addRow(tr("Invite code"), code);
+            form->addRow(tr("Room fingerprint"), fingerprint);
+            box->setMinimumWidth(440);
+            info.addContent(box);
+            info.addButton(tr("OK"), true, DDialog::ButtonRecommend);
+            info.exec();
+        });
     });
-    dlg.exec();
+    dialog.exec();
 }
 
-// ---- UC-07/UC-13: management dialog (members, admin ops, approvals, blacklist) ----
+// ---- UC-07/UC-13: management dialog ----
 void RoomsView::openManagementDialog(const QString &roomId) {
-    const RoomLocal r = m_engine->rooms()->room(roomId);
-    if (!r.joined)
+    const RoomLocal room = m_engine->rooms()->room(roomId);
+    if (!room.joined)
         return;
-    QDialog dlg(this);
-    dlg.setWindowTitle(QStringLiteral("聊天室管理 — %1").arg(r.name));
-    dlg.resize(480, 520);
-    auto *root = new QVBoxLayout(&dlg);
 
-    root->addWidget(new QLabel(QStringLiteral("邀请码：<b>%1</b> · 房间指纹：<span style='font-family:monospace'>%2</span>")
-                                   .arg(r.inviteCode, r.roomId),
-                               &dlg));
-    root->addWidget(new QLabel(QStringLiteral("成员（双击成员行执行管理操作；权限遵循 UC-07 矩阵）"), &dlg));
-    auto *members = new QListWidget(&dlg);
-    auto fillMembers = [&] {
-        members->clear();
-        for (const auto &m : m_engine->rooms()->members(roomId)) {
-            QString tag = m.role == static_cast<quint8>(MemberRole::Host) ? QStringLiteral("【托管者】")
-                        : m.role == static_cast<quint8>(MemberRole::Admin) ? QStringLiteral("【管理员】") : QString();
-            if (m.mutedUntil != 0)
-                tag += m.mutedUntil == -1 ? QStringLiteral("【禁言中】") : QStringLiteral("【限时禁言】");
-            auto *it = new QListWidgetItem(QStringLiteral("%1 %2 · %3…%4").arg(m.nickname, tag, m.fp.left(8), QString()));
-            it->setData(Qt::UserRole, m.fp);
-            it->setData(Qt::UserRole + 1, int(m.role));
-            members->addItem(it);
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Room management — %1").arg(room.name));
+    dialog.setMinimumSize(620, 540);
+    auto *root = new QVBoxLayout(&dialog);
+    root->setContentsMargins(20, 20, 20, 20);
+    root->setSpacing(12);
+
+    auto *title = new DLabel(room.name, &dialog);
+    title->setForegroundRole(DPalette::TextTitle);
+    DFontSizeManager::instance()->bind(title, DFontSizeManager::T4, QFont::DemiBold);
+    root->addWidget(title);
+
+    auto *meta = new DLabel(tr("Invite code: %1 · Room fingerprint: %2")
+                                .arg(room.inviteCode, room.roomId),
+                            &dialog);
+    meta->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    meta->setForegroundRole(DPalette::TextTips);
+    root->addWidget(meta);
+
+    auto *tabs = new QTabWidget(&dialog);
+    root->addWidget(tabs, 1);
+
+    // ---- members tab ----
+    auto *membersPage = new QWidget(tabs);
+    auto *membersLayout = new QVBoxLayout(membersPage);
+    membersLayout->setContentsMargins(0, 12, 0, 0);
+    membersLayout->setSpacing(8);
+
+    auto *members = new DListView(membersPage);
+    members->setFrameShape(QFrame::NoFrame);
+    members->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    members->setSelectionMode(QAbstractItemView::SingleSelection);
+    members->setBackgroundType(DStyledItemDelegate::RoundedBackground);
+    members->setItemMargins(QMargins(10, 6, 10, 6));
+    members->setItemSpacing(3);
+    members->setItemRadius(8);
+    auto *membersModel = new QStandardItemModel(members);
+    members->setModel(membersModel);
+    membersLayout->addWidget(members, 1);
+
+    auto *hint = new DLabel(tr("Double-click a member for moderation actions."), membersPage);
+    hint->setForegroundRole(DPalette::TextTips);
+    membersLayout->addWidget(hint);
+    tabs->addTab(membersPage, tr("Members"));
+
+    const bool iAmHost = room.hosted;
+    const bool iAmAdmin = m_engine->rooms()->myRole(roomId) == MemberRole::Admin;
+
+    auto fillMembers = [this, roomId, membersModel] {
+        membersModel->clear();
+        const QVector<RoomMemberInfo> list = m_engine->rooms()->members(roomId);
+        for (const RoomMemberInfo &member : list) {
+            const QString role = member.role == static_cast<quint8>(MemberRole::Host)
+                                     ? tr("Host")
+                                     : member.role == static_cast<quint8>(MemberRole::Admin)
+                                           ? tr("Admin")
+                                           : tr("Member");
+            QString mute;
+            if (member.mutedUntil == -1) {
+                mute = tr("muted until manually unmuted");
+            } else if (member.mutedUntil > nowMs()) {
+                mute = tr("muted until %1").arg(UiUtils::formattedTime(member.mutedUntil));
+            }
+
+            auto *item = new DStandardItem(
+                tr("%1 · %2").arg(member.nickname, role));
+            item->setData(member.fp, Qt::UserRole);
+            item->setData(int(member.role), Qt::UserRole + 1);
+            QStringList meta;
+            meta << UiUtils::shortFp(member.fp, 12);
+            if (!mute.isEmpty())
+                meta << mute;
+            auto *sub = new DViewItemAction(Qt::AlignLeft, QSize(0, 0), QSize(), false);
+            sub->setText(meta.join(QStringLiteral(" · ")));
+            sub->setFontSize(DFontSizeManager::T8);
+            sub->setTextColorRole(DPalette::TextTips);
+            item->setTextActionList({sub});
+            membersModel->appendRow(item);
         }
     };
     fillMembers();
-    root->addWidget(members, 2);
 
-    auto runOp = [&](AdminOp op, const QString &target, qint64 dur) {
-        QPointer<QDialog> gd = &dlg; // host->member ADMIN_OP result is async
-        m_engine->rooms()->requestAdminOp(roomId, target, op, dur, [gd, this, fillMembers](bool ok, QString why) mutable {
-            if (!gd)
-                return;
-            if (!ok)
-                QMessageBox::warning(gd, QStringLiteral("操作被拒绝"), why); // BR-13 越权提示
-            fillMembers();
-        });
+    auto runOp = [this, roomId, &dialog, fillMembers](AdminOp op, const QString &target, qint64 duration) {
+        QPointer<QDialog> guard(&dialog); // host->member ADMIN_OP result is async
+        m_engine->rooms()->requestAdminOp(
+            roomId, target, op, duration, [guard, fillMembers](bool ok, QString why) {
+                if (!guard)
+                    return;
+                if (!ok)
+                    UiUtils::warning(guard.data(), tr("Action rejected"), why);
+                fillMembers();
+            });
     };
 
-    connect(members, &QListWidget::itemDoubleClicked, &dlg, [&](QListWidgetItem *it) {
-        const QString target = it->data(Qt::UserRole).toString();
-        const int role = it->data(Qt::UserRole + 1).toInt();
-        QMenu menu(&dlg);
-        const bool iAmHost = m_engine->rooms()->myRole(roomId) == MemberRole::Host;
-        const bool iAmAdmin = m_engine->rooms()->myRole(roomId) == MemberRole::Admin;
+    // host/admin toolbar
+    if (iAmHost || iAmAdmin) {
+        auto *tools = new QHBoxLayout;
+        bool globalMuted = room.globalMute;
+        auto *globalMute =
+            new DPushButton(globalMuted ? tr("Disable global mute") : tr("Enable global mute"),
+                            membersPage);
+        connect(globalMute, &DPushButton::clicked, &dialog, [&] {
+            globalMuted = !globalMuted;
+            globalMute->setText(globalMuted ? tr("Disable global mute")
+                                            : tr("Enable global mute"));
+            runOp(globalMuted ? AdminOp::GlobalMuteOn : AdminOp::GlobalMuteOff, roomId, 0);
+            refreshRooms();
+        });
+        tools->addWidget(globalMute);
+
+        if (iAmHost) {
+            auto *blacklist = new DPushButton(tr("Blacklist…"), membersPage);
+            connect(blacklist, &DPushButton::clicked, &dialog, [&] {
+                const QVector<QString> entries = m_engine->rooms()->blacklist(roomId);
+                if (entries.isEmpty()) {
+                    UiUtils::info(&dialog, tr("Blacklist"), tr("The blacklist is empty."));
+                    return;
+                }
+                QStringList names;
+                for (const QString &fp : entries)
+                    names << UiUtils::shortFp(fp, 12);
+                bool ok = false;
+                const QString picked = DInputDialog::getItem(
+                    &dialog, tr("Blacklist"), tr("Select a node to unblock:"), names, 0, false, &ok);
+                if (!ok || picked.isEmpty())
+                    return;
+                const int index = names.indexOf(picked);
+                if (index >= 0 && index < entries.size())
+                    runOp(AdminOp::Unblacklist, entries.at(index), 0);
+            });
+            tools->addWidget(blacklist);
+        }
+        tools->addStretch();
+        membersLayout->insertLayout(0, tools);
+    }
+
+    connect(members, &DListView::doubleClicked, &dialog, [&](const QModelIndex &index) {
         if (!iAmHost && !iAmAdmin)
             return;
+        const QString target = index.data(Qt::UserRole).toString();
+        const int role = index.data(Qt::UserRole + 1).toInt();
+        QMenu menu(&dialog);
         if (role == int(MemberRole::Member))
-            menu.addAction(QStringLiteral("设为管理员"), [=] { runOp(AdminOp::SetAdmin, target, 0); });
+            menu.addAction(tr("Make administrator"),
+                           [=] { runOp(AdminOp::SetAdmin, target, 0); });
         if (role == int(MemberRole::Admin))
-            menu.addAction(QStringLiteral("取消管理员"), [=] { runOp(AdminOp::UnsetAdmin, target, 0); });
-        menu.addAction(QStringLiteral("禁言 10 分钟"), [=] { runOp(AdminOp::Mute, target, 10 * 60 * 1000); });
-        menu.addAction(QStringLiteral("禁言 1 小时"), [=] { runOp(AdminOp::Mute, target, 3600 * 1000); });
-        menu.addAction(QStringLiteral("禁言直至手动解除"), [=] { runOp(AdminOp::Mute, target, 0); });
-        menu.addAction(QStringLiteral("解除禁言"), [=] { runOp(AdminOp::Unmute, target, 0); });
+            menu.addAction(tr("Remove administrator"),
+                           [=] { runOp(AdminOp::UnsetAdmin, target, 0); });
+        menu.addAction(tr("Mute for 10 minutes"),
+                       [=] { runOp(AdminOp::Mute, target, 10 * 60 * 1000); });
+        menu.addAction(tr("Mute for 1 hour"),
+                       [=] { runOp(AdminOp::Mute, target, 3600 * 1000); });
+        menu.addAction(tr("Mute until manually unmuted"),
+                       [=] { runOp(AdminOp::Mute, target, 0); });
+        menu.addAction(tr("Unmute"), [=] { runOp(AdminOp::Unmute, target, 0); });
         menu.addSeparator();
-        menu.addAction(QStringLiteral("移出聊天室"), [=] { runOp(AdminOp::Kick, target, 0); });
-        menu.addAction(QStringLiteral("移出并拉黑"), [=] { runOp(AdminOp::Blacklist, target, 0); });
+        menu.addAction(tr("Remove from room"), [=] { runOp(AdminOp::Kick, target, 0); });
+        menu.addAction(tr("Remove and block"), [=] { runOp(AdminOp::Blacklist, target, 0); });
         menu.exec(QCursor::pos());
     });
 
-    // host/admin extra toolbar
-    auto *tools = new QHBoxLayout;
-    if (r.hosted || m_engine->rooms()->myRole(roomId) != MemberRole::Member) {
-        auto *gm = new QPushButton(r.globalMute ? QStringLiteral("关闭全员禁言") : QStringLiteral("开启全员禁言"), &dlg);
-        connect(gm, &QPushButton::clicked, &dlg, [&] {
-            runOp(r.globalMute ? AdminOp::GlobalMuteOff : AdminOp::GlobalMuteOn, roomId, 0); // target fp unused for global
-            refreshRooms();
-        });
-        tools->addWidget(gm);
-    }
-    if (r.hosted) {
-        auto *bl = new QPushButton(QStringLiteral("黑名单…"), &dlg);
-        connect(bl, &QPushButton::clicked, &dlg, [&] {
-            QStringList names;
-            for (const auto &fp : m_engine->rooms()->blacklist(roomId))
-                names << QStringLiteral("%1…").arg(fp.left(12));
-            bool removed = false;
-            if (names.isEmpty()) {
-                QMessageBox::information(&dlg, QStringLiteral("黑名单"), QStringLiteral("黑名单为空。"));
-                return;
-            }
-            const QString pick = QInputDialog::getItem(&dlg, QStringLiteral("黑名单"), QStringLiteral("选择要解除拉黑的节点："), names, 0, false, &removed);
-            if (!pick.isEmpty()) {
-                const QString fp = m_engine->rooms()->blacklist(roomId)[names.indexOf(pick)];
-                runOp(AdminOp::Unblacklist, fp, 0);
-            }
-        });
-        tools->addWidget(bl);
-    }
-    root->addLayout(tools);
+    connect(m_engine->rooms(), &RoomManager::membersChanged, &dialog,
+            [&](const QString &changedRoom) {
+                if (changedRoom == roomId)
+                    fillMembers();
+            });
 
-    if (r.hosted) {
-        // approvals queue (UC-06 A1 / UC-07 step 3)
-        root->addWidget(new QLabel(QStringLiteral("待批准申请："), &dlg));
-        auto *ap = new QListWidget(&dlg);
-        auto fillAp = [&] {
-            ap->clear();
-            for (const auto &p : m_engine->rooms()->pendingApprovals(roomId)) {
-                auto *it = new QListWidgetItem(QStringLiteral("%1 · %2:%3 · %4")
-                                                   .arg(p.requester.nickname, p.requester.ip)
-                                                   .arg(p.requester.tcpPort)
-                                                   .arg(QDateTime::fromMSecsSinceEpoch(p.requester.upSince).toString(QStringLiteral("HH:mm"))));
-                it->setData(Qt::UserRole, p.rowId);
-                ap->addItem(it);
+    // ---- pending approvals tab (host only) ----
+    if (iAmHost) {
+        auto *requestsPage = new QWidget(tabs);
+        auto *requestsLayout = new QVBoxLayout(requestsPage);
+        requestsLayout->setContentsMargins(0, 12, 0, 0);
+        requestsLayout->setSpacing(8);
+
+        auto *requests = new DListView(requestsPage);
+        requests->setFrameShape(QFrame::NoFrame);
+        requests->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        requests->setSelectionMode(QAbstractItemView::SingleSelection);
+        requests->setBackgroundType(DStyledItemDelegate::RoundedBackground);
+        requests->setItemMargins(QMargins(10, 6, 10, 6));
+        requests->setItemSpacing(3);
+        requests->setItemRadius(8);
+        auto *requestsModel = new QStandardItemModel(requests);
+        requests->setModel(requestsModel);
+        requestsLayout->addWidget(requests, 1);
+
+        auto fillRequests = [this, roomId, requestsModel] {
+            requestsModel->clear();
+            for (const PendingJoin &pending : m_engine->rooms()->pendingApprovals(roomId)) {
+                auto *item = new DStandardItem(
+                    tr("%1 · %2:%3 · %4")
+                        .arg(pending.requester.nickname, pending.requester.ip)
+                        .arg(pending.requester.tcpPort)
+                        .arg(UiUtils::formattedTime(pending.requester.upSince)));
+                item->setData(pending.rowId, Qt::UserRole);
+                requestsModel->appendRow(item);
             }
         };
-        fillAp();
-        root->addWidget(ap, 1);
-        connect(m_engine->rooms(), &RoomManager::joinRequested, &dlg, [&](const QString &rid, const PendingJoin &) {
-            if (rid == roomId)
-                fillAp();
+        fillRequests();
+
+        auto *actions = new QHBoxLayout;
+        auto *approve = new DSuggestButton(tr("Approve"), requestsPage);
+        auto *reject = new DPushButton(tr("Reject"), requestsPage);
+        connect(approve, &DSuggestButton::clicked, &dialog, [&] {
+            const QModelIndex index = requests->currentIndex();
+            if (!index.isValid())
+                return;
+            m_engine->rooms()->respondApproval(index.data(Qt::UserRole).toLongLong(), true);
+            fillRequests();
+            refreshRooms();
         });
-        auto *apRow = new QHBoxLayout;
-        auto *acc = new QPushButton(QStringLiteral("批准"), &dlg);
-        auto *rej = new QPushButton(QStringLiteral("拒绝"), &dlg);
-        connect(acc, &QPushButton::clicked, &dlg, [&] {
-            if (auto *it = ap->currentItem()) {
-                m_engine->rooms()->respondApproval(it->data(Qt::UserRole).toLongLong(), true);
-                fillAp();
-                refreshRooms();
-            }
+        connect(reject, &DPushButton::clicked, &dialog, [&] {
+            const QModelIndex index = requests->currentIndex();
+            if (!index.isValid())
+                return;
+            m_engine->rooms()->respondApproval(index.data(Qt::UserRole).toLongLong(), false);
+            fillRequests();
         });
-        connect(rej, &QPushButton::clicked, &dlg, [&] {
-            if (auto *it = ap->currentItem()) {
-                m_engine->rooms()->respondApproval(it->data(Qt::UserRole).toLongLong(), false);
-                fillAp();
-            }
-        });
-        apRow->addWidget(acc);
-        apRow->addWidget(rej);
-        apRow->addStretch();
-        root->addLayout(apRow);
+        actions->addWidget(approve);
+        actions->addWidget(reject);
+        actions->addStretch();
+        requestsLayout->addLayout(actions);
+        tabs->addTab(requestsPage, tr("Requests"));
+
+        connect(m_engine->rooms(), &RoomManager::joinRequested, &dialog,
+                [&](const QString &changedRoom, const PendingJoin &) {
+                    if (changedRoom == roomId)
+                        fillRequests();
+                });
     }
 
     auto *bottom = new QHBoxLayout;
-    auto *leave = new QPushButton(r.hosted ? QStringLiteral("解散聊天室…") : QStringLiteral("退出聊天室…"), &dlg);
-    leave->setStyleSheet(QStringLiteral("color:#e53935;"));
-    connect(leave, &QPushButton::clicked, &dlg, [&] {
-        const auto res = QMessageBox::question(
-            &dlg, QStringLiteral("确认"),
-            r.hosted ? QStringLiteral("解散将清除本地全部房间数据并通知所有成员（UC-13 步骤5）。确定？")
-                     : QStringLiteral("确定退出该聊天室？"));
-        if (res != QMessageBox::Yes)
+    auto *leave = new DWarningButton(&dialog);
+    leave->setText(room.hosted ? tr("Dissolve room…") : tr("Leave room…"));
+    auto *close = new DPushButton(tr("Close"), &dialog);
+    bottom->addWidget(leave);
+    bottom->addStretch();
+    bottom->addWidget(close);
+    root->addLayout(bottom);
+
+    connect(close, &DPushButton::clicked, &dialog, &QDialog::accept);
+    connect(leave, &DWarningButton::clicked, &dialog, [&] {
+        const bool ok = UiUtils::confirm(
+            &dialog, tr("Confirm"),
+            room.hosted
+                ? tr("Dissolving the room erases all local room records and notifies every member. "
+                     "Continue?")
+                : tr("Leave this room?"),
+            room.hosted ? tr("Dissolve") : tr("Leave"), true);
+        if (!ok)
             return;
-        QPointer<QDialog> gd = &dlg;
-        m_engine->rooms()->leaveRoom(roomId, [this, gd](bool ok, QString why) {
-            if (!gd)
+        QPointer<QDialog> guard(&dialog);
+        m_engine->rooms()->leaveRoom(roomId, [this, guard](bool left, QString why) {
+            if (!guard)
                 return;
-            if (!ok)
-                QMessageBox::warning(gd, QStringLiteral("退出失败"), why);
-            gd->reject();
+            if (!left) {
+                UiUtils::warning(guard.data(), tr("Leave failed"), why);
+                return;
+            }
+            guard->accept();
             refreshRooms();
         });
     });
-    auto *closeb = new QPushButton(QStringLiteral("关闭"), &dlg);
-    connect(closeb, &QPushButton::clicked, &dlg, &QDialog::accept);
-    bottom->addStretch();
-    bottom->addWidget(leave);
-    bottom->addWidget(closeb);
-    root->addLayout(bottom);
 
-    dlg.exec();
-}
-
-void RoomsView::leaveSelected() {
-    const int row = m_roomList->currentRow();
-    if (row < 0)
-        return;
-    openManagementDialog(m_roomList->item(row)->data(Qt::UserRole).toString());
+    dialog.exec();
 }
 
 } // namespace meshlink

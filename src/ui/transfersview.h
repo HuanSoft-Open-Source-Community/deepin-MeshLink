@@ -6,7 +6,17 @@
 #include <QHash>
 #include <QWidget>
 
-class QTableWidget;
+#include <dtkwidget_global.h>
+
+class QLabel;
+class QModelIndex;
+class QStackedWidget;
+class QStandardItemModel;
+class QTableView;
+
+DWIDGET_BEGIN_NAMESPACE
+class DLabel;
+DWIDGET_END_NAMESPACE
 
 namespace meshlink {
 
@@ -15,13 +25,20 @@ class Engine;
 class TransfersView : public QWidget {
     Q_OBJECT
 public:
-    TransfersView(Engine *engine, QWidget *parent = nullptr);
+    explicit TransfersView(Engine *engine, QWidget *parent = nullptr);
 
-private:
+private slots:
     void refresh();
 
+private:
+    void showTaskMenu(const QModelIndex &index);
+
     Engine *m_engine;
-    QTableWidget *m_table = nullptr;
+    QTableView *m_table = nullptr;
+    QStandardItemModel *m_model = nullptr;
+    QStackedWidget *m_stack = nullptr;
+    QWidget *m_emptyPage = nullptr;
+    DTK_WIDGET_NAMESPACE::DLabel *m_countLabel = nullptr;
     QHash<QString, qint64> m_lastBytes; // speed estimation window
     QHash<QString, qint64> m_lastMs;
 };

@@ -86,17 +86,27 @@ bool Engine::hasLocalAccount() {
 }
 
 bool Engine::start(QString *error) {
+    m_startStage = StartStage::None;
     Paths::ensureDirs();
+    m_startStage = StartStage::Storage;
     if (!m_storage.open(Paths::databaseFile(), error))
         return false;
 
+    m_startStage = StartStage::Identity;
     if (!m_account.hasAccount()) {
-        if (!m_account.createAccount({}, error)) // UC-01 first-run default path
+        const qint64 id = m_account.createNewAccount({}, error); // UC-01 first-run default path
+        if (id < 0)
             return false;
-    } else if (!m_account.loadAccount(error)) { // UC-01 A1 failure -> re-init dialog
+        m_settings->setActiveAccountId(id);
+    } else if (!m_account.loadAccount(qMax<qint64>(1, m_settings->activeAccountId()), error)) {
+        // UC-01 A1 failure -> re-init dialog
         return false;
     }
+    return startNetwork(error);
+}
 
+bool Engine::startNetwork(QString *error) {
+    m_startStage = StartStage::Tcp;
     m_segment = m_settings->lanSegment();
     m_lanIp = m_segment.ip;
     m_account.setLanIp(m_lanIp);
@@ -112,8 +122,10 @@ bool Engine::start(QString *error) {
         *error = lerr;
         return false;
     }
+    m_startStage = StartStage::Udp;
     if (!m_discovery.start(error)) // UC-04 E1 (UDP side)
         return false;
+    m_startStage = StartStage::None;
     // UC-04 E2: unicast bootstrap peers where broadcast is blocked
     for (const auto &entry : m_settings->bootstrapTargets()) {
         const int sep = entry.lastIndexOf(':');
@@ -123,25 +135,40 @@ bool Engine::start(QString *error) {
     m_discovery.setHostedRooms(m_rooms.hostedSummaries());
 
     // periodic room-state resync keeps snapshots fresh after flaps (NFR-01)
-    auto *t = new QTimer(this);
-    connect(t, &QTimer::timeout, this, [this]() { m_rooms.resyncAll(); });
-    t->start(60'000);
+    if (!m_resyncTimer) {
+        m_resyncTimer = new QTimer(this);
+        connect(m_resyncTimer, &QTimer::timeout, this, [this]() { m_rooms.resyncAll(); });
+    }
+    m_resyncTimer->start(60'000);
 
     m_downloader.recoverTasks(); // UC-11 resume-after-restart
+    m_networkRunning = true;
     emit started(true);
     return true;
 }
 
-void Engine::shutdown() {
+void Engine::stopNetwork() {
+    if (!m_networkRunning)
+        return;
+    if (m_resyncTimer)
+        m_resyncTimer->stop();
     m_discovery.stop(); // signed farewell first (UC-04 A1)
     m_link.stopListening();
+    // Channels authenticated with the old identity must not survive a switch.
+    for (SecureChannel *ch : m_link.channels())
+        ch->close();
+    m_networkRunning = false;
+}
+
+void Engine::shutdown() {
+    stopNetwork();
     m_storage.close();
 }
 
 bool Engine::setLanSegment(const LanSegment &segment, QString *error) {
     if (!segment.isValid()) {
         if (error)
-            *error = QStringLiteral("无效的局域网网段：%1/%2").arg(segment.ip).arg(segment.prefixLength);
+            *error = tr("Invalid LAN segment: %1/%2").arg(segment.ip).arg(segment.prefixLength);
         return false;
     }
     if (segment == m_segment) {
@@ -162,25 +189,77 @@ bool Engine::createFreshAccount(const QString &nickname, QString *error) {
     Paths::ensureDirs();
     if (!m_storage.open(Paths::databaseFile(), error))
         return false;
-    if (m_account.hasAccount()) { // UC-01 A2: replace old identity deliberately
-        if (!m_account.destroyAccount(true, error))
-            return false;
+    if (m_account.hasAccount()) { // UC-01 A2: replace the (broken) active identity
+        m_account.destroyAccount(true, error);
     }
-    return m_account.createAccount(nickname, error);
+    const qint64 id = m_account.createNewAccount(nickname, error);
+    if (id < 0)
+        return false;
+    m_settings->setActiveAccountId(id);
+    return true;
 }
 
-bool Engine::destroyAccount(bool alsoHistory, QString *error) {
+qint64 Engine::createAdditionalAccount(const QString &nickname, QString *error) {
+    Paths::ensureDirs();
+    if (!m_storage.isOpen() && !m_storage.open(Paths::databaseFile(), error))
+        return -1;
+    const qint64 id = m_account.createNewAccount(nickname, error);
+    if (id < 0)
+        return -1;
+    m_settings->setActiveAccountId(id);
+    if (m_networkRunning && !switchAccount(id, error))
+        return -1;
+    return id;
+}
+
+bool Engine::switchAccount(qint64 accountId, QString *error) {
+    if (!m_storage.isOpen() && !m_storage.open(Paths::databaseFile(), error))
+        return false;
+    const bool wasRunning = m_networkRunning;
+    stopNetwork();
+    m_settings->setActiveAccountId(accountId);
+    m_account.resetLoaded();
+    m_startStage = StartStage::Identity;
+    if (!m_account.loadAccount(accountId, error)) {
+        m_startStage = StartStage::Identity;
+        return false;
+    }
+    if (wasRunning && !startNetwork(error))
+        return false;
+    m_rooms.resyncAll();
+    emit accountSwitched(accountId);
+    return true;
+}
+
+int Engine::destroyAccount(bool alsoHistory, QString *error) {
+    const bool dbg = qEnvironmentVariableIsSet("MESHLINK_DEBUG");
     // UC-02 step 4: best-effort "leave"/"dissolve" notifications over the
     // already-established TLS channels, before the identity and its keys go.
     const auto rooms = m_rooms.myRooms();
+    if (dbg)
+        fprintf(stderr, "[destroy] myRooms=%lld\n", (long long)rooms.size());
     for (const auto &r : rooms)
         m_rooms.leaveRoom(r.roomId, [](bool, const QString &) {});
-    m_discovery.stop(); // signed farewell first (UC-04 A1)
-    m_link.stopListening();
+    if (dbg)
+        fprintf(stderr, "[destroy] leaves sent\n");
+    // Stop everything that touches storage: resync timer, heartbeats, the
+    // TLS listener, live channels and in-flight download workers (their
+    // chunk_progress writes would race the wipe below).
+    stopNetwork();
+    for (const auto &t : m_downloader.tasks())
+        m_downloader.cancel(t.hash, false);
+    m_networkRunning = false;
+    if (dbg)
+        fprintf(stderr, "[destroy] network stopped, wiping\n");
     // Wipe while the database connection is still usable, close it afterwards.
-    const bool ok = m_account.destroyAccount(alsoHistory, error);
+    const int remaining = m_account.destroyAccount(alsoHistory, error);
+    if (dbg)
+        fprintf(stderr, "[destroy] wipe done remaining=%d err=%s\n", remaining,
+                error ? qUtf8Printable(*error) : "-");
     m_storage.close();
-    return ok;
+    if (dbg)
+        fprintf(stderr, "[destroy] storage closed\n");
+    return remaining;
 }
 
 bool Engine::sendToPeer(const QString &fp, MsgType type, const QByteArray &payload) {
@@ -228,8 +307,9 @@ void Engine::route(MsgType type, SecureChannel *ch, const QByteArray &payload) {
     const auto t = std::underlying_type_t<MsgType>(type);
     if (t >= std::underlying_type_t<MsgType>(MsgType::JoinRequest) && t <= std::underlying_type_t<MsgType>(MsgType::AdminOp))
         m_rooms.handle(type, ch, payload); // room/join/admin/member frames
-    else if (type == MsgType::ChatMessage || type == MsgType::ChatAck || type == MsgType::BlobRequest ||
-             type == MsgType::BlobData)
+    else if (type == MsgType::ChatMessage || type == MsgType::ChatAck ||
+             type == MsgType::ChatRecall || type == MsgType::ChatRecallAck ||
+             type == MsgType::BlobRequest || type == MsgType::BlobData)
         m_chat.handle(type, ch, payload);
     else if (type == MsgType::FileAnnounce || type == MsgType::SuppliersQuery || type == MsgType::SuppliersResponse ||
              type == MsgType::FileRequest || type == MsgType::ChunkRequest)

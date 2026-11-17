@@ -134,8 +134,17 @@ static void wireEvents(NodeCtl *n) {
         const bool mine = n->ownMsgIds.contains(m.msgId);
         ev("msg", {{"room", roomId}, {"id", m.msgId}, {"seq", double(m.seq)}, {"kind", int(m.kind)},
                    {"sender", m.senderFp.left(8)}, {"nick", m.senderNick}, {"text", m.text.left(80)},
-                   {"hash", m.contentHash}, {"mine", mine}});
+                   {"hash", m.contentHash}, {"mine", mine}, {"replyTo", m.replyTo},
+                   {"recalled", m.recalled}});
     });
+    QObject::connect(e->chat(), &ChatManager::messageRecalled, e,
+                     [](const QString &roomId, const QString &msgId, const QString &byFp) {
+                         ev("recalled", {{"room", roomId}, {"id", msgId}, {"by", byFp.left(8)}});
+                     });
+    QObject::connect(e->chat(), &ChatManager::recallFailed, e,
+                     [](const QString &roomId, const QString &msgId, const QString &why) {
+                         ev("recallfail", {{"room", roomId}, {"id", msgId}, {"why", why}});
+                     });
     QObject::connect(e->chat(), &ChatManager::messageStatusChanged, e, [n](const QString &, const QString &msgId, quint8 st) {
         // always forward: synchronous host-echo status fires before sendText returns
         Q_UNUSED(n);
@@ -244,6 +253,26 @@ static void handleLine(NodeCtl *n, const QString &line) {
             ev("senderr", {{"why", err}});
         else
             n->ownMsgIds.insert(id);
+    } else if (cmd == "sendq") { // sendq <room> <replyTo> <text...>
+        QString err;
+        const QString text = line.section(' ', 3);
+        const QString id = e->chat()->sendText(a.value(1), text, &err, a.value(2));
+        if (id.isEmpty())
+            ev("senderr", {{"why", err}});
+        else
+            n->ownMsgIds.insert(id);
+    } else if (cmd == "recall") { // recall <room> <msgId>
+        QString err;
+        const bool accepted = e->chat()->recallMessage(a.value(1), a.value(2), &err);
+        ev("recallreq", {{"room", a.value(1)}, {"id", a.value(2)}, {"ok", accepted}, {"why", err}});
+    } else if (cmd == "recallraw") { // host-side validation path, bypass local pre-check
+        const RoomLocal r = e->rooms()->room(a.value(1));
+        ChatRecallMsg req;
+        req.roomId = a.value(1);
+        req.msgId = a.value(2);
+        const bool sent = !r.hostFp.isEmpty() &&
+                          e->sendToPeer(r.hostFp, MsgType::ChatRecall, req.toPayload());
+        ev("recallraw", {{"room", a.value(1)}, {"id", a.value(2)}, {"sent", sent}});
     } else if (cmd == "sendimage") { // sendimage <room> <path>
         QString err;
         const QString id = e->chat()->sendImage(a.value(1), a.value(2), &err);
@@ -261,8 +290,10 @@ static void handleLine(NodeCtl *n, const QString &line) {
     } else if (cmd == "msgs") {
         QJsonArray arr;
         for (const auto &m : e->chat()->history(a.value(1), 500))
-            arr.append(QJsonObject{{"seq", double(m.seq)}, {"kind", int(m.kind)}, {"sender", m.senderFp.left(8)},
-                                   {"text", m.text.left(40)}, {"hash", m.contentHash}, {"id", m.msgId}});
+            arr.append(QJsonObject{{"seq", double(m.seq)}, {"kind", int(m.kind)},
+                                   {"sender", m.senderFp.left(8)}, {"text", m.text.left(40)},
+                                   {"hash", m.contentHash}, {"id", m.msgId},
+                                   {"replyTo", m.replyTo}, {"recalled", m.recalled}});
         ev("msgs", {{"list", arr}});
     } else if (cmd == "op") { // op <room> <targetfp> <opname> [ms]
         static const std::map<QString, AdminOp> ops = {
@@ -337,8 +368,10 @@ static void handleLine(NodeCtl *n, const QString &line) {
         ev("hasfile", {{"hash", a.value(1)}, {"path", q.next() ? q.value(0).toString() : QString()}});
     } else if (cmd == "destroy") { // destroy [keep|wipe]
         QString err;
-        const bool ok = e->destroyAccount(a.value(1) != "keep", &err);
-        ev("destroyed", {{"ok", ok}, {"err", err}});
+        // Engine::destroyAccount returns the remaining account count:
+        // >= 0 success (0 = last account destroyed), -1 failure.
+        const int remaining = e->destroyAccount(a.value(1) != "keep", &err);
+        ev("destroyed", {{"ok", remaining >= 0}, {"left", double(remaining)}, {"err", err}});
     } else if (cmd == "nick") { // nick <newname>
         QString err;
         ev("nickres", {{"ok", e->account()->updateProfile(a.value(1), {}, &err)}, {"err", err}});
@@ -482,7 +515,7 @@ struct Node {
             }
             // (stderr is forwarded, nothing to drain here)
         }
-        fail(QStringLiteral("timeout waiting for %1 on node %2 (pending: %3)").arg(type, name, lines.join(" | ").left(600)));
+        fail(QStringLiteral("timeout waiting for %1 on node %2 (pending: %3)").arg(type, name, lines.join(" | ").left(4000)));
         return {};
     }
     void killNow() {
@@ -549,7 +582,8 @@ static int parentMain(QCoreApplication &app) {
           << QStringLiteral("MESHLINK_OFFLINE_PERIODS=4")
           << QStringLiteral("MESHLINK_CHUNK_KB=64")
           << QStringLiteral("MESHLINK_THREADS=3")
-          << QStringLiteral("MESHLINK_CHUNK_DELAY_MS=50"); // deterministic mid-transfer states
+          << QStringLiteral("MESHLINK_CHUNK_DELAY_MS=50") // deterministic mid-transfer states
+          << QStringLiteral("MESHLINK_RECALL_WINDOW_MS=1500"); // fast recall-expiry tests
         if (evil)
             e << QStringLiteral("MESHLINK_EVIL_CHUNKS=1");
         return e;
@@ -714,7 +748,7 @@ static int parentMain(QCoreApplication &app) {
     alice.waitEvent("opres", [](const QJsonObject &o) { return o["ok"].toBool(); }, 8000);
     QThread::msleep(1200); // let the MemberEvent reach bob's mute state
     bob.cmd(QStringLiteral("send %1 我已被禁言").arg(roomA));
-    bob.waitEvent("senderr", [](const QJsonObject &o) { return o["why"].toString().contains(QStringLiteral("禁言")); }, 10000);
+    bob.waitEvent("senderr", [](const QJsonObject &o) { return !o["why"].toString().isEmpty(); }, 10000);
     // non-host cannot mute others beyond rights: carol(member) tries -> rejected (403 path)
     carol.cmd(QStringLiteral("op %1 %2 mute 1000").arg(roomA, bob.fp));
     carol.waitEvent("opres", [](const QJsonObject &o) { return !o["ok"].toBool(); }, 8000);
@@ -727,7 +761,7 @@ static int parentMain(QCoreApplication &app) {
     bob.waitEvent("kicked", [&](const QJsonObject &o) { return o["room"].toString() == roomA; }, 10000);
     // admin (carol) must not be able to mute the host (BR-13)
     carol.cmd(QStringLiteral("op %1 %2 mute 1000").arg(roomA, alice.fp));
-    carol.waitEvent("opres", [](const QJsonObject &o) { return !o["ok"].toBool() && o["err"].toString().contains(QStringLiteral("管理员")); }, 8000);
+    carol.waitEvent("opres", [](const QJsonObject &o) { return !o["ok"].toBool() && !o["err"].toString().isEmpty(); }, 8000);
     // blacklist blocks rejoin even with open policy (BR-14)
     alice.cmd(QStringLiteral("op %1 %2 black 0").arg(roomA, bob.fp));
     alice.waitEvent("opres", [](const QJsonObject &o) { return o["ok"].toBool(); }, 8000);
@@ -855,6 +889,93 @@ static int parentMain(QCoreApplication &app) {
     if (sha256OfFile(done3b["dest"].toString()) != hash3)
         alice.fail("restart-resumed download produced a corrupt file (BR-20/BR-24)");
     printf("[S7b crash-restart resume OK]\n");
+
+    // ---- S11 quote + recall (UC-08 extension): 2-minute self window,
+    // host/admin override, tombstone persistence, non-moderator rejection ----
+    alice.cmd(QStringLiteral("send %1 quote-target").arg(roomA));
+    const auto targetEvent = bob.waitEvent(
+        "msg", [](const QJsonObject &o) { return o["text"].toString() == QStringLiteral("quote-target"); },
+        10000);
+    const QString targetId = targetEvent["id"].toString();
+    bob.cmd(QStringLiteral("sendq %1 %2 quoted-by-bob").arg(roomA, targetId));
+    const auto quotedEvent = alice.waitEvent(
+        "msg", [](const QJsonObject &o) { return o["text"].toString() == QStringLiteral("quoted-by-bob"); },
+        10000);
+    if (quotedEvent["replyTo"].toString() != targetId)
+        alice.fail("quoted message lost its replyTo reference");
+    const QString quotedId = quotedEvent["id"].toString();
+
+    bob.cmd(QStringLiteral("recall %1 %2").arg(roomA, quotedId));
+    bob.waitEvent("recallreq", [&](const QJsonObject &o) { return o["ok"].toBool(); }, 5000);
+    alice.waitEvent("recalled",
+                    [&](const QJsonObject &o) { return o["id"].toString() == quotedId; }, 10000);
+    bob.waitEvent("recalled",
+                  [&](const QJsonObject &o) { return o["id"].toString() == quotedId; }, 10000);
+    alice.cmd(QStringLiteral("msgs %1").arg(roomA));
+    {
+        const auto list = alice.waitEvent("msgs", {}, 8000)["list"].toArray();
+        bool found = false;
+        for (const auto &v : list) {
+            const auto m = v.toObject();
+            if (m["id"].toString() != quotedId)
+                continue;
+            found = true;
+            if (!m["recalled"].toBool())
+                alice.fail("recall did not persist the tombstone flag");
+            if (!m["text"].toString().isEmpty())
+                alice.fail("recall did not clear the message body");
+        }
+        if (!found)
+            alice.fail("recalled message disappeared from history");
+    }
+
+    // Sender window expiry: local pre-check rejects after 1.5s (test override).
+    bob.cmd(QStringLiteral("send %1 expiring-bob").arg(roomA));
+    const auto expiring = bob.waitEvent(
+        "msg", [](const QJsonObject &o) { return o["text"].toString() == QStringLiteral("expiring-bob"); },
+        10000);
+    QThread::msleep(2200);
+    bob.cmd(QStringLiteral("recall %1 %2").arg(roomA, expiring["id"].toString()));
+    bob.waitEvent("recallreq", [](const QJsonObject &o) { return !o["ok"].toBool(); }, 5000);
+
+    // Host-side window enforcement: bypass the local pre-check with a raw frame.
+    bob.cmd(QStringLiteral("recallraw %1 %2").arg(roomA, expiring["id"].toString()));
+    bob.waitEvent("recallfail",
+                  [&](const QJsonObject &o) { return o["id"].toString() == expiring["id"].toString(); },
+                  10000);
+
+    // Host can recall any message at any time.
+    bob.cmd(QStringLiteral("send %1 host-recalls").arg(roomA));
+    const auto hostTarget = bob.waitEvent(
+        "msg", [](const QJsonObject &o) { return o["text"].toString() == QStringLiteral("host-recalls"); },
+        10000);
+    QThread::msleep(1800);
+    alice.cmd(QStringLiteral("recall %1 %2").arg(roomA, hostTarget["id"].toString()));
+    bob.waitEvent("recalled",
+                  [&](const QJsonObject &o) { return o["id"].toString() == hostTarget["id"].toString(); },
+                  10000);
+
+    // Administrator (carol) can recall a message from the host at any time.
+    alice.cmd(QStringLiteral("send %1 admin-recalls").arg(roomA));
+    const auto adminTarget = bob.waitEvent(
+        "msg", [](const QJsonObject &o) { return o["text"].toString() == QStringLiteral("admin-recalls"); },
+        10000);
+    QThread::msleep(1800);
+    carol.cmd(QStringLiteral("recall %1 %2").arg(roomA, adminTarget["id"].toString()));
+    bob.waitEvent("recalled",
+                  [&](const QJsonObject &o) { return o["id"].toString() == adminTarget["id"].toString(); },
+                  10000);
+
+    // A normal member cannot recall somebody else's (unrecalled) message.
+    alice.cmd(QStringLiteral("send %1 member-cannot-recall").arg(roomA));
+    const auto protectedTarget = bob.waitEvent(
+        "msg", [](const QJsonObject &o) { return o["text"].toString() == QStringLiteral("member-cannot-recall"); },
+        10000);
+    bob.cmd(QStringLiteral("recallraw %1 %2").arg(roomA, protectedTarget["id"].toString()));
+    bob.waitEvent("recallfail",
+                  [&](const QJsonObject &o) { return o["id"].toString() == protectedTarget["id"].toString(); },
+                  10000);
+    printf("[S11 quote+recall OK]\n");
 
     // ---- S8 host dissolve + member cleanup (UC-13) ----
     carol.cmd(QStringLiteral("leave %1").arg(roomC));

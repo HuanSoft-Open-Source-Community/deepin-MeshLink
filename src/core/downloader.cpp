@@ -306,7 +306,7 @@ static QString suppliersJson(const QVector<SupplierInfo> &sup) {
 void Downloader::startTask(const QString &roomId, const QString &hash, const QString &name, qint64 size,
                            const QString &mime, const QVector<SupplierInfo> &suppliers) {
     if (suppliers.isEmpty()) { // UC-10 E1: no supply yet
-        setStatusDb(hash, static_cast<quint8>(TaskStatus::WaitingSupply), QStringLiteral("等待供给节点"));
+        setStatusDb(hash, static_cast<quint8>(TaskStatus::WaitingSupply), tr("Waiting for a supplier"));
         return;
     }
     auto ctx = m_ctx.value(hash);
@@ -412,7 +412,7 @@ void Downloader::onMetaFailure(const QString &hash) {
             ctx->deadSuppliers.insert(s.fp);
     }
     setStatusDb(hash, static_cast<quint8>(TaskStatus::WaitingSupply),
-                QStringLiteral("供给节点暂时不可用，进度已保留"));
+                tr("Supplier temporarily unavailable; progress kept"));
 }
 
 void Downloader::applyMeta(const QString &hash, const QJsonObject &meta) {
@@ -506,7 +506,7 @@ void Downloader::dispatchNext(const QString &hash) {
         // task (supplier came back) must retry the handshake instead of failing
         // with "empty file" (UC-11 E1).
         if (ctx->fileSize == 0) {
-            setStatusDb(hash, static_cast<quint8>(TaskStatus::Failed), QStringLiteral("文件为空或不可知"));
+            setStatusDb(hash, static_cast<quint8>(TaskStatus::Failed), tr("File is empty or its size is unknown"));
             return;
         }
         requestMeta(hash);
@@ -555,7 +555,7 @@ void Downloader::dispatchNext(const QString &hash) {
                 for (auto i : batch)
                     claim->claimed.remove(i);
                 setStatusDb(hash, static_cast<quint8>(TaskStatus::WaitingSupply),
-                            QStringLiteral("所有候选供给节点不可用，已下载分片保留"));
+                            tr("All candidate suppliers are unavailable; downloaded chunks are kept"));
                 return;
             }
         }
@@ -746,7 +746,7 @@ void Downloader::beginVerify(const QString &hash) {
             if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
                 QMetaObject::invokeMethod(guard.data(), [guard, hash]() {
                     if (guard)
-                        guard->setStatusDb(hash, static_cast<quint8>(TaskStatus::Failed), QStringLiteral("无法写入临时文件"));
+                        guard->setStatusDb(hash, static_cast<quint8>(TaskStatus::Failed), Downloader::tr("Could not write the temporary file"));
                 }, Qt::QueuedConnection);
                 return;
             }
@@ -818,8 +818,8 @@ void Downloader::handleCorruptWithBadList(const QString &hash, const QJsonArray 
     ctx->round++;
     if (ctx->round > 5) { // UC-12 E1
         setStatusDb(hash, static_cast<quint8>(TaskStatus::Failed),
-                    QStringLiteral("文件校验持续失败，建议更换供给节点或放弃任务"));
-        emit taskFailed(hash, QStringLiteral("校验持续失败"));
+                    tr("File verification keeps failing; try another supplier or cancel the task"));
+        emit taskFailed(hash, tr("Verification keeps failing"));
         return;
     }
     QVector<quint64> redo;
@@ -885,7 +885,7 @@ void Downloader::finalizeOk(const QString &hash, const QString &mergedTmp) {
         // fallback: re-merge chunk files (still durable until verification passes)
         QFile out(dest);
         if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            setStatusDb(hash, static_cast<quint8>(TaskStatus::Failed), QStringLiteral("无法写入目标文件"));
+            setStatusDb(hash, static_cast<quint8>(TaskStatus::Failed), tr("Could not write the destination file"));
             return;
         }
         for (quint64 i = 0; i < ctx->totalChunks; ++i) {
@@ -893,7 +893,7 @@ void Downloader::finalizeOk(const QString &hash, const QString &mergedTmp) {
             if (!cf.open(QIODevice::ReadOnly)) {
                 out.close();
                 QFile::remove(dest);
-                setStatusDb(hash, static_cast<quint8>(TaskStatus::Failed), QStringLiteral("分片丢失"));
+                setStatusDb(hash, static_cast<quint8>(TaskStatus::Failed), Downloader::tr("A chunk is missing"));
                 return;
             }
             out.write(cf.readAll());
@@ -967,7 +967,7 @@ void Downloader::cancel(const QString &hash, bool deletePartialChunks) {
         dq.bindValue(0, hash);
         dq.exec();
     } else {
-        setStatusDb(hash, static_cast<quint8>(TaskStatus::Paused), QStringLiteral("已暂停"));
+        setStatusDb(hash, static_cast<quint8>(TaskStatus::Paused), tr("Paused"));
     }
     emit taskChanged(hash);
 }
@@ -998,13 +998,13 @@ void Downloader::recoverTasks() {
                 m_ctx[hash] = ctx;
                 m_claims[hash] = std::make_shared<Claim>();
                 if (sup.isEmpty()) {
-                    setStatusDb(hash, static_cast<quint8>(TaskStatus::WaitingSupply), QStringLiteral("等待供给节点"));
+                    setStatusDb(hash, static_cast<quint8>(TaskStatus::WaitingSupply), tr("Waiting for a supplier"));
                 } else if (st == int(TaskStatus::WaitingSupply)) {
                     // Waiting for an offline supplier: keep the task and mark every
                     // candidate dead so the next heartbeat revives it (UC-11 E1).
                     for (const auto &s : sup)
                         ctx->deadSuppliers.insert(s.fp);
-                    setStatusDb(hash, static_cast<quint8>(TaskStatus::WaitingSupply), QStringLiteral("等待供给节点"));
+                    setStatusDb(hash, static_cast<quint8>(TaskStatus::WaitingSupply), tr("Waiting for a supplier"));
                 } else {
                     startTask(info.value(0).toString(), hash, info.value(1).toString(),
                               info.value(2).toLongLong(), info.value(3).toString(), sup);

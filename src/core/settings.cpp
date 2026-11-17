@@ -83,6 +83,44 @@ int Settings::downloadThreads() const {
     return e.isEmpty() ? m_settings.value("files/downloadThreads", kDefaultThreads).toInt() : e.toInt();
 }
 int Settings::maxRoomHistory() const { return m_settings.value("chat/maxHistory", 200).toInt(); }
+bool Settings::hideNavLabels() const { return m_settings.value("interface/hideNavLabels", false).toBool(); }
+bool Settings::sendWithEnter() const { return m_settings.value("chat/sendWithEnter", true).toBool(); }
+void Settings::setHideNavLabels(bool hide) { m_settings.setValue("interface/hideNavLabels", hide); emit changed(); }
+void Settings::setSendWithEnter(bool enter) { m_settings.setValue("chat/sendWithEnter", enter); emit changed(); }
+
+bool Settings::notificationsEnabled() const {
+    return m_settings.value("notifications/enabled", true).toBool();
+}
+bool Settings::notificationPreview() const {
+    return m_settings.value("notifications/preview", true).toBool();
+}
+bool Settings::trayEnabled() const { return m_settings.value("behavior/trayEnabled", true).toBool(); }
+Settings::CloseAction Settings::closeAction() const {
+    const QString raw = m_settings.value("behavior/closeAction", QStringLiteral("ask")).toString();
+    if (raw == QLatin1String("minimize"))
+        return CloseAction::Minimize;
+    if (raw == QLatin1String("exit"))
+        return CloseAction::Exit;
+    return CloseAction::Ask;
+}
+void Settings::setNotificationsEnabled(bool on) { m_settings.setValue("notifications/enabled", on); emit changed(); }
+void Settings::setNotificationPreview(bool show) { m_settings.setValue("notifications/preview", show); emit changed(); }
+void Settings::setTrayEnabled(bool on) { m_settings.setValue("behavior/trayEnabled", on); emit changed(); }
+void Settings::setCloseAction(CloseAction action) {
+    const char *raw = action == CloseAction::Minimize ? "minimize"
+                      : action == CloseAction::Exit   ? "exit"
+                                                      : "ask";
+    m_settings.setValue("behavior/closeAction", QString::fromLatin1(raw));
+    emit changed();
+}
+
+qint64 Settings::activeAccountId() const {
+    return m_settings.value("accounts/activeId", 1).toLongLong();
+}
+void Settings::setActiveAccountId(qint64 id) {
+    m_settings.setValue("accounts/activeId", id);
+    emit changed();
+}
 
 void Settings::setDiscoveryPort(quint16 v) { m_settings.setValue("network/discoveryPort", int(v)); emit changed(); }
 void Settings::setTcpPort(quint16 v) { m_settings.setValue("network/tcpPort", int(v)); emit changed(); }

@@ -6,65 +6,91 @@
 #include "core/engine.h"
 #include "core/lansegment.h"
 #include "core/settings.h"
+#include "uiutils.h"
 
-#include <QComboBox>
-#include <QDialogButtonBox>
+#include <DComboBox>
+#include <DFontSizeManager>
+#include <DLabel>
+#include <DLineEdit>
+#include <DPushButton>
+#include <DTipLabel>
+
+#include <QApplication>
 #include <QFormLayout>
 #include <QHBoxLayout>
-#include <QLabel>
-#include <QLineEdit>
-#include <QPushButton>
 #include <QVBoxLayout>
 
 DWIDGET_USE_NAMESPACE
+DGUI_USE_NAMESPACE
 
 namespace meshlink {
 
-FirstStartWizard::FirstStartWizard(Engine *engine, QWidget *parent) : DDialog(parent), m_engine(engine) {
-    setTitle(QStringLiteral("欢迎使用深度织讯"));
-    setWindowTitle(QStringLiteral("深度织讯 — 初始化账户"));
+FirstStartWizard::FirstStartWizard(Engine *engine, QWidget *parent)
+    : DDialog(parent), m_engine(engine) {
+    setTitle(tr("Welcome to deepin-MeshLink"));
+    setWindowTitle(tr("deepin-MeshLink — Set up account"));
+    setIcon(qApp->windowIcon());
+    setMessage(tr("A local identity (Ed25519 key pair + fingerprint) will be generated on this "
+                  "machine. Nothing is uploaded to a server."));
 
-    auto *form = new QWidget(this);
-    auto *lay = new QFormLayout(form);
-    m_nick = new QLineEdit(form);
-    m_nick->setPlaceholderText(QStringLiteral("留空则自动生成（2–32 字符，UC-03 规则校验）"));
-    m_segments = new QComboBox(form);
-    auto *segRow = new QWidget(form);
-    auto *segLay = new QHBoxLayout(segRow);
-    segLay->setContentsMargins(0, 0, 0, 0);
-    segLay->addWidget(m_segments, 1);
-    auto *refresh = new QPushButton(QStringLiteral("刷新"), segRow);
-    segLay->addWidget(refresh);
-    m_error = new QLabel(form);
+    auto *content = new QWidget(this);
+    auto *form = new QFormLayout(content);
+    form->setContentsMargins(0, 0, 0, 0);
+    form->setSpacing(12);
+
+    m_nick = new DLineEdit(content);
+    m_nick->setPlaceholderText(tr("Leave empty to auto-generate (2–32 characters)"));
+    m_nick->lineEdit()->setMaxLength(32);
+
+    auto *segmentRow = new QWidget(content);
+    auto *segmentLayout = new QHBoxLayout(segmentRow);
+    segmentLayout->setContentsMargins(0, 0, 0, 0);
+    segmentLayout->setSpacing(8);
+    m_segments = new DComboBox(segmentRow);
+    auto *refresh = new DPushButton(tr("Refresh"), segmentRow);
+    segmentLayout->addWidget(m_segments, 1);
+    segmentLayout->addWidget(refresh);
+
+    m_error = new DTipLabel(QString(), content);
     m_error->setWordWrap(true);
-    m_error->setStyleSheet(QStringLiteral("color:#e53935;"));
-    lay->addRow(QStringLiteral("昵称："), m_nick);
-    lay->addRow(QStringLiteral("局域网网段："), segRow);
-    lay->addRow(m_error);
-    addContent(form);
+    m_error->setForegroundRole(DPalette::TextWarning);
+    m_error->hide();
 
-    connect(refresh, &QPushButton::clicked, this, &FirstStartWizard::reloadSegments);
-    reloadSegments();
+    form->addRow(tr("Nickname"), m_nick);
+    form->addRow(tr("LAN segment"), segmentRow);
+    form->addRow(m_error);
+    content->setMinimumWidth(460);
+    addContent(content);
 
-    addButton(QStringLiteral("创建账户"), true, DDialog::ButtonRecommend);
-    addButton(QStringLiteral("退出"));
+    addButton(tr("Create account"), true, DDialog::ButtonRecommend);
+    addButton(tr("Quit"));
 
+    connect(refresh, &DPushButton::clicked, this, &FirstStartWizard::reloadSegments);
     connect(this, &DDialog::buttonClicked, this, [this](int index, const QString &) {
         if (index == 0)
             createAccount();
         else
             reject();
     });
+    reloadSegments();
 }
 
 void FirstStartWizard::createAccount() {
     // Persist the LAN segment first: account creation snapshots the LAN address
     // (UC-01 step 7) and Engine::start() will bring discovery up on this segment.
     m_engine->settings()->setLanSegment(selectedSegment());
-    QString err;
-    // UC-01 steps: keygen -> fingerprint -> encrypted keystore -> profile
-    if (!m_engine->createFreshAccount(m_nick->text().trimmed(), &err)) {
-        m_error->setText(err.isEmpty() ? QStringLiteral("密钥生成失败，请重试") : err); // E1
+    m_nick->setAlert(false);
+    m_error->hide();
+    QString error;
+    // UC-01 steps: keygen -> fingerprint -> encrypted keystore -> profile.
+    // Add-mode keeps other accounts; fresh mode replaces the (broken) identity.
+    const bool ok = m_addMode ? m_engine->createAdditionalAccount(m_nick->text().trimmed(), &error) >= 0
+                              : m_engine->createFreshAccount(m_nick->text().trimmed(), &error);
+    if (!ok) {
+        const QString text = error.isEmpty() ? tr("Key generation failed. Please try again.") : error;
+        m_nick->setAlert(true);
+        m_error->setText(text); // E1
+        m_error->show();
         return;
     }
     accept();
@@ -77,28 +103,40 @@ void FirstStartWizard::reloadSegments() {
     m_segments->clear();
     int select = -1;
     for (int i = 0; i < m_segmentList.size(); ++i) {
-        const auto &s = m_segmentList[i];
-        m_segments->addItem(s.label());
-        if (s.ip == current.ip && s.prefixLength == current.prefixLength)
+        const LanSegment &segment = m_segmentList.at(i);
+        const QString label =
+            forced ? QStringLiteral("%1/%2").arg(segment.ip).arg(segment.prefixLength)
+                   : QStringLiteral("%1 · %2/%3")
+                         .arg(segment.interfaceName, segment.ip)
+                         .arg(segment.prefixLength);
+        m_segments->addItem(label);
+        m_segments->setItemData(i, segment.label(), Qt::ToolTipRole);
+        if (segment.ip == current.ip && segment.prefixLength == current.prefixLength)
             select = i;
     }
     if (select < 0 && !m_segmentList.isEmpty())
         select = 0;
     if (select >= 0)
         m_segments->setCurrentIndex(select);
-    // MESHLINK_IP pins the segment for tests/headless runs; UI must not pretend
-    // a different choice would be applied.
+    // MESHLINK_IP pins the segment for tests/headless runs; the UI must not
+    // pretend a different choice would be applied.
     m_segments->setEnabled(!forced);
-    m_segments->setToolTip(forced ? QStringLiteral("当前由 MESHLINK_IP 环境变量固定，界面选择不生效")
-                                  : QStringLiteral("心跳只在该网段广播并接收；运行中可在设置页随时切换"));
-    if (m_segmentList.isEmpty())
-        m_error->setText(QStringLiteral("未发现可用 IPv4 网卡，将使用本机回环地址"));
+    m_segments->setToolTip(
+        forced ? tr("Pinned by the MESHLINK_IP environment variable")
+               : tr("Heartbeats are broadcast into and accepted only from this segment; it can be "
+                    "changed later in Settings"));
+    if (m_segmentList.isEmpty()) {
+        m_error->setText(tr("No usable IPv4 interface was found; the loopback address will be used."));
+        m_error->show();
+    } else {
+        m_error->hide();
+    }
 }
 
 LanSegment FirstStartWizard::selectedSegment() const {
     const int row = m_segments ? m_segments->currentIndex() : -1;
     if (row >= 0 && row < m_segmentList.size())
-        return m_segmentList[row];
+        return m_segmentList.at(row);
     return m_engine->settings()->lanSegment();
 }
 
@@ -107,22 +145,38 @@ bool FirstStartWizard::ensureAccount(Engine *engine, QWidget *parent) {
     // engine whether an account row already exists in the local database.
     if (engine->hasLocalAccount())
         return true;
-    FirstStartWizard w(engine, parent);
-    return w.exec() == QDialog::Accepted;
+    FirstStartWizard wizard(engine, parent);
+    return wizard.exec() == QDialog::Accepted;
 }
 
 bool FirstStartWizard::runAsRecovery(Engine *engine, QWidget *parent) {
-    FirstStartWizard w(engine, parent);
-    w.setMessage(QStringLiteral("本机账户无法解密（设备或凭据已变更）。\n创建新账户将清除旧账户的本地数据，且不可恢复。"));
-    if (w.exec() != QDialog::Accepted)
+    FirstStartWizard wizard(engine, parent);
+    wizard.setMessage(
+        tr("The local account could not be decrypted (device or credentials changed).\n"
+           "Creating a new account will erase the old account's local data; this cannot be "
+           "undone."));
+    if (wizard.exec() != QDialog::Accepted)
         return false;
-    QString err;
-    if (!engine->start(&err)) { // retry bringing up networking with the fresh identity
-        w.setTitle(QStringLiteral("启动失败"));
-        w.m_error->setText(err);
+    QString error;
+    if (!engine->start(&error)) { // retry bringing up networking with the fresh identity
+        UiUtils::warning(parent, tr("Startup failed"), error);
         return false;
     }
     return true;
+}
+
+bool FirstStartWizard::createAdditionalAccount(Engine *engine, QWidget *parent) {
+    FirstStartWizard wizard(engine, parent);
+    wizard.m_addMode = true;
+    wizard.setTitle(tr("Add account"));
+    wizard.setWindowTitle(tr("deepin-MeshLink — Add account"));
+    wizard.setMessage(tr("Another local identity (Ed25519 key pair + fingerprint) will be "
+                         "generated. Existing accounts stay available and can be switched to "
+                         "any time."));
+    wizard.setButtonText(1, tr("Cancel")); // "Quit" reads wrong when adding
+    if (wizard.exec() != QDialog::Accepted)
+        return false;
+    return engine->account()->profile().valid;
 }
 
 } // namespace meshlink
