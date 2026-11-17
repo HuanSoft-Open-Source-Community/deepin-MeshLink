@@ -40,6 +40,8 @@ enum class MsgType : quint8 {
     // chat
     ChatMessage = 30,   // member -> host ; host -> members
     ChatAck = 31,       // host -> sender
+    ChatRecall = 32,    // member -> host (request) ; host -> members (event)
+    ChatRecallAck = 33, // host -> actor (failure / result)
     // files
     FileAnnounce = 40,  // member -> host -> members (announcement only, no bytes)
     SuppliersQuery = 41,// member -> host
@@ -115,6 +117,11 @@ struct Msg {
     qint64 ts = 0;
     quint8 status = 0;
     QString contentHash, fileName, mime;
+    QString replyTo;       // quoted msgId (empty = none)
+    bool recalled = false; // tombstone; content fields are cleared
+    QString recalledBy;
+    qint64 recalledTs = 0;
+    qint64 recvTs = 0;     // host-authoritative receipt time (recall window)
     qint64 fileSize = -1;
     int imgW = 0, imgH = 0;
     QVariantMap toMap() const;
@@ -139,6 +146,7 @@ struct ChatMessageMsg {
     qint64 ts = 0;
     // image/file metadata embedded in the *announcement* only (no binaries, BR-15/17)
     QString contentHash, fileName, mime;
+    QString replyTo;       // quoted msgId
     qint64 fileSize = -1, mutedUntilEcho = 0;
     int imgW = 0, imgH = 0;
     QByteArray toPayload() const;
@@ -155,10 +163,25 @@ struct ChatAckMsg {
 
 struct FileAnnounceMsg {
     QString roomId, msgId, fileHash, fileName, mime, announcerFp, announcerNick, avatarHash;
+    QString replyTo; // quoted msgId
     qint64 fileSize = 0, ts = 0;
     quint8 mode = 0; // 0 = new announcement (message + supplier), 1 = supplier registration only
     QByteArray toPayload() const;
     static bool fromPayload(const QByteArray &, FileAnnounceMsg &);
+};
+
+struct ChatRecallMsg {
+    QString roomId, msgId;
+    QByteArray toPayload() const;
+    static bool fromPayload(const QByteArray &, ChatRecallMsg &);
+};
+
+struct ChatRecallAckMsg {
+    QString roomId, msgId;
+    bool ok = false;
+    QString error;
+    QByteArray toPayload() const;
+    static bool fromPayload(const QByteArray &, ChatRecallAckMsg &);
 };
 
 struct SuppliersQueryMsg {

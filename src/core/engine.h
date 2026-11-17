@@ -26,8 +26,12 @@ public:
     explicit Engine(Settings *settings, QObject *parent = nullptr);
     ~Engine() override;
 
-    // UC-01: create or unlock the local account, then bring up networking.
+    // Stage reached by the last start() failure. Lets the UI choose recovery
+    // (identity) vs. network-settings diagnostics without matching translated
+    // error strings.
+    enum class StartStage { None, Storage, Identity, Tcp, Udp };
     bool start(QString *error);
+    StartStage startStage() const { return m_startStage; }
     void shutdown(); // UC-04 farewell + stop listeners
 
     // UC-01: whether an account row already exists on disk (used by the
@@ -41,8 +45,14 @@ public:
 
     // A2 (UC-01): create a brand-new identity, wiping any existing one.
     bool createFreshAccount(const QString &nickname, QString *error);
+    // Multi-account: create an additional identity and make it active; the
+    // network rebinds to it in place when the engine is already running.
+    qint64 createAdditionalAccount(const QString &nickname, QString *error);
+    // Multi-account: switch the active identity (stops/restarts networking).
+    bool switchAccount(qint64 accountId, QString *error);
     // UC-02: destroy local account, keys and history.
-    bool destroyAccount(bool alsoHistory, QString *error);
+    int destroyAccount(bool alsoHistory, QString *error);
+    bool networkRunning() const { return m_networkRunning; }
 
     // Deliver a frame to `fp`, dialing on demand when no channel is open yet.
     bool sendToPeer(const QString &fp, MsgType type, const QByteArray &payload);
@@ -66,9 +76,14 @@ signals:
     void spoofingSuspected(const QString &fingerprint); // UC-03 A1 surfaced to UI
     void started(bool ok);
     void lanSegmentChanged(const QString &label);
+    void accountSwitched(qint64 accountId); // multi-account: identity reloaded
 
 private:
     void route(MsgType type, SecureChannel *ch, const QByteArray &payload);
+    // Network bring-up shared by start() and switchAccount(); the identity
+    // must already be loaded when this runs.
+    bool startNetwork(QString *error);
+    void stopNetwork();
 
     Settings *m_settings;
     Storage m_storage;
@@ -82,6 +97,9 @@ private:
     FileManager m_files;
     QString m_lanIp;
     qint64 m_lastResyncMs = 0;
+    StartStage m_startStage = StartStage::None;
+    bool m_networkRunning = false;
+    QTimer *m_resyncTimer = nullptr;
 };
 
 } // namespace meshlink

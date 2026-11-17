@@ -12,7 +12,7 @@
 
 namespace meshlink {
 
-// In-memory view of the (single) local account.
+// In-memory view of one local account (multi-account: the active one).
 struct Profile {
     QString fingerprint;
     QString nickname;
@@ -26,6 +26,16 @@ struct Profile {
     bool valid = false;
 };
 
+// Persisted account row summary (multi-account list views).
+struct AccountEntry {
+    qint64 id = 0;
+    QString fingerprint;
+    QString nickname;
+    QString avatarHash;
+    QString avatarPath;
+    qint64 createdTs = 0;
+};
+
 class AccountManager : public QObject {
     Q_OBJECT
 public:
@@ -34,17 +44,30 @@ public:
     bool hasAccount();
     const Profile &profile() const { return m_profile; }
 
-    // UC-01: create account (keygen, fingerprint, encrypted keystore, default profile).
-    // Emits created/failed through return value; E1 -> returns false with *error.
-    bool createAccount(const QString &desiredNickname /*may be empty -> default*/, QString *error);
-    // UC-01 A1: load existing account; fails if keystore cannot be decrypted.
-    bool loadAccount(QString *error);
+    // ---- multi-account surface ----
+    // All local accounts, ordered by creation.
+    QVector<AccountEntry> listAccounts() const;
+    // Row id of the profile currently loaded into memory; 0 when none loaded.
+    qint64 activeRowId() const { return m_activeId; }
+    // UC-01: create a new identity row and load it into memory. Never touches
+    // other accounts; the caller picks the active id through Settings.
+    // Returns the new row id, or -1 on failure (E1 -> *error).
+    qint64 createNewAccount(const QString &desiredNickname /*may be empty -> default*/,
+                            QString *error);
+    // UC-01 A1: load account `id`; fails if the keystore cannot be decrypted.
+    bool loadAccount(qint64 id, QString *error);
+    // Drop the loaded profile so the next loadAccount() actually reloads.
+    void resetLoaded() { m_profile = Profile{}; m_activeId = 0; }
+
+    // UC-02 steps 5-6 (local part): secure-erase the loaded identity, remove
+    // its rows and (optionally) its rooms/history. Returns accounts left.
+    int destroyAccount(bool wipeHistoryAndFiles, QString *error);
+    // Same semantics for an arbitrary account (deleting a non-active one).
+    bool deleteAccount(qint64 id, bool wipeHistoryAndFiles, QString *error);
+
     // UC-03: validate (2..32 chars) + persist nickname/avatar; avatar file is
     // copied into the data dir, rendered circular, hashed for broadcast.
     bool updateProfile(const QString &nickname, const QString &avatarSourcePath, QString *error);
-
-    // UC-02 steps 5-6 (local part): secure-erase private key, remove identity rows.
-    bool destroyAccount(bool wipeHistoryAndFiles, QString *error);
 
     // UC-01 step 7: associate the current LAN address with the account (refreshed
     // whenever the interface changes; not broadcast as extra private info).
@@ -70,9 +93,13 @@ signals:
 private:
     bool persistKeystore(const Bytes &keystoreBlob, QString *error);
     Bytes kek() const;
+    // Legacy single-account builds stored avatars at avatars/current.png;
+    // multi-account locations are avatars/<id>.png. Moves the file if needed.
+    void ensureAvatarLocation(qint64 id);
 
     Storage *m_storage = nullptr;
     Profile m_profile;
+    qint64 m_activeId = 0;
     Bytes m_edPriv;   // decrypted session-private key material (memory only)
     QString m_tlsKeyPem;
 };

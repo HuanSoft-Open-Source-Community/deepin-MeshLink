@@ -33,6 +33,22 @@ class Settings : public QObject {
 public:
     explicit Settings(QObject *parent = nullptr);
 
+    // ---- desktop notifications / tray behaviour ----
+    enum class CloseAction { Ask = 0, Minimize = 1, Exit = 2 };
+
+    bool notificationsEnabled() const;  // global XDG desktop notifications
+    bool notificationPreview() const;   // show message text in the popup
+    bool trayEnabled() const;           // XDG StatusNotifierItem tray icon
+    CloseAction closeAction() const;    // what a window close means
+    void setNotificationsEnabled(bool on);
+    void setNotificationPreview(bool show);
+    void setTrayEnabled(bool on);
+    void setCloseAction(CloseAction action);
+
+    // ---- multi-account ----
+    qint64 activeAccountId() const;     // account row to load at start
+    void setActiveAccountId(qint64 id);
+
     // ---- network ----
     quint16 discoveryPort() const;      // UDP heartbeat port (default 2425)
     quint16 tcpPort() const;            // TLS listener port (default 2426)
@@ -43,6 +59,12 @@ public:
     quint64 chunkSize() const;          // bytes, default 256 KiB (256*1024)
     int downloadThreads() const;        // parallel chunk workers, default 4
     int maxRoomHistory() const;         // messages kept in snapshot, default 200
+
+    // ---- interface / composer ----
+    bool hideNavLabels() const;         // icon-only navigation rail, default false
+    bool sendWithEnter() const;         // Enter sends (Shift+Enter = newline), default true
+    void setHideNavLabels(bool hide);
+    void setSendWithEnter(bool enter);
 
     void setDiscoveryPort(quint16 v);
     void setTcpPort(quint16 v);

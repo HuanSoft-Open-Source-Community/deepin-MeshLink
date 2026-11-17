@@ -24,7 +24,7 @@ inline constexpr const char *kOrgDomain = "huansoft.org.cn";
 
 // ---- wire constants ----
 inline constexpr quint32 kFrameMagic = 0x4D4C4E4B; // "MLNK"
-inline constexpr quint8 kProtoVersion = 2;          // v2: 32-hex room ids + invite codes
+inline constexpr quint8 kProtoVersion = 3;          // v3: replies + recall tombstones
 inline constexpr quint8 kHeartbeatFormat = 2;       // v2: room summaries carry invite codes
 inline constexpr int kFrameHeaderSize = 12; // magic4+ver1+type1+reserved2+len4
 inline constexpr quint32 kMaxFramePayload = 8u * 1024 * 1024; // 8 MiB
@@ -32,6 +32,19 @@ inline constexpr quint32 kMaxUdpPacket = 1400;                // stays under MTU
 inline constexpr int kMaxHeartbeatRooms = 8;                  // room summaries per heartbeat
 inline constexpr int kRoomIdHexLen = 32;                      // room fingerprint id
 inline constexpr int kInviteCodeDigits = 6;                   // numeric invite code
+inline constexpr qint64 kSelfRecallWindowMs = 2 * 60 * 1000;  // 2 minutes
+
+// Test-only override; production default is exactly 2 minutes.
+inline qint64 selfRecallWindowMs() {
+    const QByteArray overrideValue = qgetenv("MESHLINK_RECALL_WINDOW_MS");
+    if (!overrideValue.isEmpty()) {
+        bool ok = false;
+        const qint64 value = overrideValue.toLongLong(&ok);
+        if (ok && value >= 0)
+            return value;
+    }
+    return kSelfRecallWindowMs;
+}
 
 using MsgId = QString;   // random 16-hex
 using FileHash = QString; // 64-hex sha256
@@ -41,6 +54,17 @@ using RoomId = QString;  // 32-hex room fingerprint, derived on creation
 enum class JoinPolicy : quint8 { Open = 0, Approval = 1 };
 
 enum class MemberRole : quint8 { Host = 0, Admin = 1, Member = 2 };
+
+// Pure authorization predicate shared by the host, the requester UI and the
+// unit tests. `receivedTs` is the host-authoritative receipt time.
+inline bool canRecallMessage(MemberRole role, const QString &actorFp, const QString &senderFp,
+                             qint64 receivedTs, qint64 now,
+                             qint64 windowMs = kSelfRecallWindowMs) {
+    if (role == MemberRole::Host || role == MemberRole::Admin)
+        return true;
+    return actorFp == senderFp && now - receivedTs <= windowMs;
+}
+
 
 enum class MuteMode : quint8 { None = 0, Timed = 1, UntilManual = 2 };
 

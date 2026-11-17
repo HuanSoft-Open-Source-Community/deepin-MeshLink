@@ -64,10 +64,11 @@ QVector<SupplierInfo> FileManager::suppliersLocal(const QString &hash) const {
 }
 
 void FileManager::announceFile(const QString &roomId, const QString &path,
-                               std::function<void(const QString &, const QString &)> cb) {
+                               std::function<void(const QString &, const QString &)> cb,
+                               const QString &replyTo) {
     const QFileInfo fi(path);
     if (!fi.exists() || !fi.isFile()) {
-        cb(QString(), QStringLiteral("文件不存在"));
+        cb(QString(), tr("File not found"));
         return;
     }
     const QString name = fi.fileName();
@@ -76,14 +77,14 @@ void FileManager::announceFile(const QString &roomId, const QString &path,
 
     // SHA-256 streaming in the pool (NFR-03: hashing must not block the GUI)
     QPointer<FileManager> guard(this);
-    (void)QtConcurrent::run([guard, path, roomId, name, size, mime, cb]() {
+    (void)QtConcurrent::run([guard, path, roomId, name, size, mime, cb, replyTo]() {
         if (!guard)
             return;
         QString hash;
         {
             QFile f(path);
             if (!f.open(QIODevice::ReadOnly)) {
-                QMetaObject::invokeMethod(guard.data(), [cb]() { cb(QString(), QStringLiteral("文件不可读")); },
+                QMetaObject::invokeMethod(guard.data(), [cb]() { cb(QString(), tr("File is not readable")); },
                                           Qt::QueuedConnection);
                 return;
             }
@@ -94,9 +95,9 @@ void FileManager::announceFile(const QString &roomId, const QString &path,
         }
         QMetaObject::invokeMethod(
             guard.data(),
-            [guard, roomId, path, name, size, mime, hash, cb]() {
+            [guard, roomId, path, name, size, mime, hash, cb, replyTo]() {
                 if (guard)
-                    guard->announceHashed(roomId, path, hash, name, size, mime, cb);
+                    guard->announceHashed(roomId, path, hash, name, size, mime, cb, replyTo);
             },
             Qt::QueuedConnection);
     });
@@ -104,15 +105,16 @@ void FileManager::announceFile(const QString &roomId, const QString &path,
 
 void FileManager::announceHashed(const QString &roomId, const QString &path, const QString &hash, const QString &name,
                                 qint64 size, const QString &mime,
-                                std::function<void(const QString &, const QString &)> cb) {
+                                std::function<void(const QString &, const QString &)> cb,
+                                const QString &replyTo) {
     const RoomLocal r = m_rooms->room(roomId);
     if (!r.joined) {
-        cb(QString(), QStringLiteral("请先加入聊天室"));
+        cb(QString(), tr("Join the room first"));
         return;
     }
     qint64 until = 0;
     if (m_rooms->isMuted(roomId, &until)) {
-        cb(QString(), QStringLiteral("你已被禁言")); // 禁言覆盖文件通告（属消息流）
+        cb(QString(), tr("You are muted")); // 禁言覆盖文件通告（属消息流）
         return;
     }
     // BR-18: announcing registers *this* node as a holder/supplier.
@@ -137,12 +139,13 @@ void FileManager::announceHashed(const QString &roomId, const QString &path, con
     fa.avatarHash = prof.avatarHash;
     fa.fileSize = size;
     fa.ts = nowMs();
+    fa.replyTo = replyTo;
     fa.mode = 0;
 
     if (r.hosted) {
         hostReceiveAnnounce(fa, nullptr); // self host: authoritative store + fan-out
     } else if (!m_send || !m_send(r.hostFp, MsgType::FileAnnounce, fa.toPayload())) {
-        cb(QString(), QStringLiteral("通告未送达（托管节点不可达）")); // UC-09 异常: host offline
+        cb(QString(), tr("Announcement not delivered (host unreachable)")); // UC-09 异常: host offline
         return;
     }
     cb(fa.msgId, QString());
@@ -162,6 +165,17 @@ void FileManager::hostReceiveAnnounce(const FileAnnounceMsg &fa, SecureChannel *
             member = true;
     if (!member)
         return;
+
+    // A late/duplicate announcement must not resurrect a recalled file message.
+    {
+        QSqlQuery existing = m_storage->query(
+            "SELECT recalled FROM messages WHERE room_id=? AND msg_id=?");
+        existing.bindValue(0, fa.roomId);
+        existing.bindValue(1, fa.msgId);
+        existing.exec();
+        if (existing.next() && existing.value(0).toInt() != 0)
+            return;
+    }
 
     QString ip;
     quint16 port = 0;
@@ -203,6 +217,8 @@ void FileManager::hostReceiveAnnounce(const FileAnnounceMsg &fa, SecureChannel *
     m.fileName = fa.fileName;
     m.mime = fa.mime;
     m.fileSize = fa.fileSize;
+    m.replyTo = fa.replyTo;
+    m.recvTs = nowMs();
     MessageStore::append(m_storage, m);
 
     const auto ms = m_rooms->members(fa.roomId);
@@ -331,6 +347,7 @@ void FileManager::handle(MsgType type, SecureChannel *ch, const QByteArray &payl
                 m.fileName = fa.fileName;
                 m.mime = fa.mime;
                 m.fileSize = fa.fileSize;
+                m.replyTo = fa.replyTo;
                 QSqlQuery ex = m_storage->query("SELECT 1 FROM messages WHERE room_id=? AND msg_id=?");
                 ex.bindValue(0, m.roomId);
                 ex.bindValue(1, m.msgId);

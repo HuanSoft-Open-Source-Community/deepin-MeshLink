@@ -77,8 +77,15 @@ public:
     QVector<QString> blacklist(const QString &roomId) const;
     RoomLocal room(const QString &roomId) const;
     MemberRole myRole(const QString &roomId) const;
+    MemberRole roleOf(const QString &roomId, const QString &fingerprint) const;
+    bool isModerator(const QString &roomId, const QString &fingerprint) const;
+    bool isMember(const QString &roomId, const QString &fingerprint) const;
     bool isMuted(const QString &roomId, qint64 *untilOut = nullptr) const; // incl. globalMute
     QVector<RoomSummary> hostedSummaries() const; // for heartbeat broadcast (UC-05 step 5)
+
+    // ---- per-room local preferences (do-not-disturb; local-only state) ----
+    bool isRoomDnd(const QString &roomId) const;
+    void setRoomDnd(const QString &roomId, bool dnd);
 
     // ---- UC-07 admin surface (host executes; remote admin sends ADMIN_OP) ----
     bool canManage(const QString &roomId, const QString &actorFp, const QString &targetFp, AdminOp op, QString *why);
@@ -94,6 +101,7 @@ public:
 signals:
     void roomsChanged();
     void membersChanged(const QString &roomId);
+    void roomDndChanged(const QString &roomId, bool dnd);
     void joinRequested(const QString &roomId, const PendingJoin &request); // host UI notification
     void joinResult(const QString &roomId, JoinStatus status, const QString &detail); // also async approvals
     void kickedFromRoom(const QString &roomId, const QString &reason);

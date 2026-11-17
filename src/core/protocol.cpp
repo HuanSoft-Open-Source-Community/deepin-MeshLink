@@ -86,7 +86,8 @@ static void writeMsgList(QDataStream &ds, const QVector<Msg> &msgs) {
     ds << static_cast<quint32>(msgs.size());
     for (const auto &m : msgs) {
         ds << m.msgId << m.senderFp << m.senderNick << m.avatarHash << m.kind << m.seq << m.ts
-           << m.text << m.contentHash << m.fileName << m.mime << m.fileSize << m.imgW << m.imgH;
+           << m.text << m.contentHash << m.fileName << m.mime << m.fileSize << m.imgW << m.imgH
+           << m.replyTo << m.recalled << m.recalledBy << m.recalledTs;
     }
 }
 static QVector<Msg> readMsgList(QDataStream &ds) {
@@ -99,7 +100,8 @@ static QVector<Msg> readMsgList(QDataStream &ds) {
     for (quint32 i = 0; i < n; ++i) {
         Msg m;
         ds >> m.msgId >> m.senderFp >> m.senderNick >> m.avatarHash >> m.kind >> m.seq >> m.ts
-           >> m.text >> m.contentHash >> m.fileName >> m.mime >> m.fileSize >> m.imgW >> m.imgH;
+           >> m.text >> m.contentHash >> m.fileName >> m.mime >> m.fileSize >> m.imgW >> m.imgH
+           >> m.replyTo >> m.recalled >> m.recalledBy >> m.recalledTs;
         out.append(m);
     }
     return out;
@@ -146,13 +148,14 @@ bool RoomSnapshotMsg::fromPayload(const QByteArray &p, RoomSnapshotMsg &m) {
 QByteArray ChatMessageMsg::toPayload() const {
     return payloadOf([this](QDataStream &ds) {
         ds << roomId << msgId << senderFp << senderNick << avatarHash << kind << seq << ts << text
-           << contentHash << fileName << mime << fileSize << imgW << imgH;
+           << contentHash << fileName << mime << fileSize << imgW << imgH << replyTo;
     });
 }
 bool ChatMessageMsg::fromPayload(const QByteArray &p, ChatMessageMsg &m) {
     return readPayload(p, [&m](QDataStream &ds) {
         ds >> m.roomId >> m.msgId >> m.senderFp >> m.senderNick >> m.avatarHash >> m.kind >> m.seq
-           >> m.ts >> m.text >> m.contentHash >> m.fileName >> m.mime >> m.fileSize >> m.imgW >> m.imgH;
+           >> m.ts >> m.text >> m.contentHash >> m.fileName >> m.mime >> m.fileSize >> m.imgW >> m.imgH
+           >> m.replyTo;
         return ds.status() != QDataStream::ReadPastEnd;
     });
 }
@@ -160,7 +163,11 @@ bool ChatMessageMsg::fromPayload(const QByteArray &p, ChatMessageMsg &m) {
 MESH_LINK_IMPL_SIMPLE(ChatAckMsg, (ds << msgId << seq << delivered), (ds >> m.msgId >> m.seq >> m.delivered))
 
 MESH_LINK_IMPL_SIMPLE(FileAnnounceMsg,
-                      (ds << roomId << msgId << fileHash << fileName << mime << announcerFp << announcerNick << avatarHash << fileSize << ts << mode), (ds >> m.roomId >> m.msgId >> m.fileHash >> m.fileName >> m.mime >> m.announcerFp >> m.announcerNick >> m.avatarHash >> m.fileSize >> m.ts >> m.mode))
+                      (ds << roomId << msgId << fileHash << fileName << mime << announcerFp << announcerNick << avatarHash << fileSize << ts << mode << replyTo), (ds >> m.roomId >> m.msgId >> m.fileHash >> m.fileName >> m.mime >> m.announcerFp >> m.announcerNick >> m.avatarHash >> m.fileSize >> m.ts >> m.mode >> m.replyTo))
+
+MESH_LINK_IMPL_SIMPLE(ChatRecallMsg, (ds << roomId << msgId), (ds >> m.roomId >> m.msgId))
+MESH_LINK_IMPL_SIMPLE(ChatRecallAckMsg, (ds << roomId << msgId << ok << error),
+                      (ds >> m.roomId >> m.msgId >> m.ok >> m.error))
 
 MESH_LINK_IMPL_SIMPLE(SuppliersQueryMsg, (ds << fileHash), (ds >> m.fileHash))
 
@@ -270,7 +277,9 @@ QVariantMap Msg::toMap() const {
     return {{"roomId", roomId}, {"msgId", msgId},  {"senderFp", senderFp},   {"senderNick", senderNick},
             {"avatarHash", avatarHash}, {"kind", kind}, {"seq", static_cast<qulonglong>(seq)}, {"ts", ts},
             {"status", status}, {"contentHash", contentHash}, {"fileName", fileName}, {"mime", mime},
-            {"fileSize", fileSize}, {"imgW", imgW}, {"imgH", imgH}, {"text", text}};
+            {"fileSize", fileSize}, {"imgW", imgW}, {"imgH", imgH}, {"text", text},
+            {"replyTo", replyTo}, {"recalled", recalled}, {"recalledBy", recalledBy},
+            {"recalledTs", recalledTs}, {"recvTs", recvTs}};
 }
 Msg Msg::fromMap(const QVariantMap &m) {
     Msg x;
@@ -290,6 +299,11 @@ Msg Msg::fromMap(const QVariantMap &m) {
     x.imgW = m.value("imgW").toInt();
     x.imgH = m.value("imgH").toInt();
     x.text = m.value("text").toString();
+    x.replyTo = m.value("replyTo").toString();
+    x.recalled = m.value("recalled").toBool();
+    x.recalledBy = m.value("recalledBy").toString();
+    x.recalledTs = m.value("recalledTs").toLongLong();
+    x.recvTs = m.value("recvTs").toLongLong();
     return x;
 }
 

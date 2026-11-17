@@ -3,6 +3,7 @@
 // Copyright (C) 2026 HuanSoft Open Source Community <https://huansoft.org.cn>
 #include "lansegment.h"
 
+#include <QCoreApplication>
 #include <QNetworkInterface>
 
 #include <algorithm>
@@ -81,8 +82,8 @@ bool LanSegment::contains(const QHostAddress &addr) const {
 
 QString LanSegment::label() const {
     if (!isValid())
-        return QStringLiteral("未选择网段");
-    return QStringLiteral("%1 · %2/%3 → 广播 %4")
+        return QCoreApplication::translate("LanSegment", "No segment selected");
+    return QCoreApplication::translate("LanSegment", "%1 · %2/%3 → broadcast %4")
         .arg(interfaceName.isEmpty() ? QStringLiteral("?") : interfaceName, ip)
         .arg(prefixLength)
         .arg(broadcastAddress().toString());
@@ -103,7 +104,7 @@ LanSegment fromEnvironment() {
     if (forced.isEmpty())
         return {};
     LanSegment s;
-    s.interfaceName = QStringLiteral("(环境变量)");
+    s.interfaceName = QCoreApplication::translate("LanSegment", "(environment)");
     s.ip = QString::fromLatin1(forced);
     const QByteArray prefix = qgetenv("MESHLINK_LAN_PREFIX");
     s.prefixLength = prefix.isEmpty() ? (QHostAddress(s.ip).isLoopback() ? 8 : 24) : prefix.toInt();

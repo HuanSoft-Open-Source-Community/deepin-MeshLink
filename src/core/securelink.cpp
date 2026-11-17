@@ -340,7 +340,7 @@ bool SecureLink::tofuCheck(const QString &fp, const QString &certFp, QString *wh
         const QString known = q.value(0).toString();
         if (known != certFp) {
             if (why)
-                *why = QStringLiteral("目标节点证书指纹与首次信任记录不符，疑似中间人攻击");
+                *why = tr("The peer certificate fingerprint does not match the first-trust record; possible man-in-the-middle attack");
             emit mitmSuspected(fp, QStringLiteral("cert %1 != pinned %2").arg(certFp.left(12), known.left(12)));
             return false;
         }

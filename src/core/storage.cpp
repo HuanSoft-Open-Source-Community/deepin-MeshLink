@@ -6,6 +6,7 @@
 #include "common.h"
 #include "crypto.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QPair>
@@ -76,10 +77,12 @@ bool Storage::createSchema(QString *error) {
     db().exec("PRAGMA journal_mode=WAL");
     db().exec("PRAGMA foreign_keys=ON");
     const char *ddl[] = {
-        // NFR-07: account identity, public material, encrypted private keystore blob.
+        // NFR-07: account identity, public material, encrypted private keystore
+        // blob. Multi-account: rows are keyed by an autoincrement id; the
+        // active account is chosen through Settings.
         "CREATE TABLE IF NOT EXISTS account ("
-        " id INTEGER PRIMARY KEY CHECK(id=1),"
-        " fingerprint TEXT NOT NULL,"
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " fingerprint TEXT NOT NULL UNIQUE,"
         " nickname TEXT NOT NULL,"
         " ed25519_pub BLOB NOT NULL,"
         " x25519_pub  BLOB NOT NULL,"
@@ -87,9 +90,9 @@ bool Storage::createSchema(QString *error) {
         " cert_pem TEXT NOT NULL,"
         " created_ts INTEGER NOT NULL)",
 
-        // UC-03/UC-01: profile + LAN ip snapshot.
+        // UC-03/UC-01: profile + LAN ip snapshot, one row per account.
         "CREATE TABLE IF NOT EXISTS profile ("
-        " id INTEGER PRIMARY KEY CHECK(id=1),"
+        " account_id INTEGER PRIMARY KEY,"
         " avatar_path TEXT,"
         " avatar_hash TEXT,"
         " lan_ip TEXT)",
@@ -133,7 +136,8 @@ bool Storage::createSchema(QString *error) {
         " msg_id TEXT, room_id TEXT, seq INTEGER, sender_fp TEXT, sender_nick TEXT,"
         " avatar_hash TEXT, kind INTEGER, ts INTEGER, status INTEGER,"
         " text TEXT, content_hash TEXT, file_name TEXT, mime TEXT, file_size INTEGER,"
-        " img_w INTEGER, img_h INTEGER,"
+        " img_w INTEGER, img_h INTEGER, reply_to TEXT, recalled INTEGER DEFAULT 0,"
+        " recalled_by TEXT, recalled_ts INTEGER DEFAULT 0, recv_ts INTEGER DEFAULT 0,"
         " PRIMARY KEY(room_id, msg_id))",
 
         // UC-09/10: file announcements + supplier registry.
@@ -168,6 +172,12 @@ bool Storage::createSchema(QString *error) {
         " file_hash TEXT, chunk_size INTEGER, path TEXT, mtime INTEGER,"
         " chunk_hashes TEXT,"
         " PRIMARY KEY(file_hash, chunk_size))",
+
+        // Per-room local preferences (do-not-disturb). Local-only state that
+        // never rides the wire protocol.
+        "CREATE TABLE IF NOT EXISTS room_prefs ("
+        " room_id TEXT PRIMARY KEY,"
+        " dnd INTEGER DEFAULT 0)",
     };
     for (const char *sql : ddl) {
         if (!exec(sql, error))
@@ -218,6 +228,120 @@ bool Storage::migrate(QString *error) {
         }
     }
 
+    // v3 chat schema: quoted-message reference, recall tombstone and the
+    // host-authoritative receive timestamp used by the 2-minute window.
+    struct AddedColumn {
+        const char *name;
+        const char *definition;
+    };
+    for (const AddedColumn &column : {AddedColumn{"reply_to", "TEXT"},
+                                      AddedColumn{"recalled", "INTEGER DEFAULT 0"},
+                                      AddedColumn{"recalled_by", "TEXT"},
+                                      AddedColumn{"recalled_ts", "INTEGER DEFAULT 0"},
+                                      AddedColumn{"recv_ts", "INTEGER DEFAULT 0"}}) {
+        if (tableHasColumn(database, "messages", QString::fromLatin1(column.name)))
+            continue;
+        QSqlQuery alter(database);
+        if (!alter.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN %1 %2")
+                            .arg(QString::fromLatin1(column.name),
+                                 QString::fromLatin1(column.definition)))) {
+            if (error)
+                *error = alter.lastError().text();
+            return false;
+        }
+    }
+
+    // Multi-account schema: the 1.0.0 build pinned account/profile to id=1 and
+    // had no notion of which local identity owns a room. Rebuild both tables
+    // (idempotent) and tag rooms with their owning identity.
+    bool legacyAccount = false;
+    {
+        QSqlQuery ddl(database);
+        // Whitespace-normalised match so minor DDL formatting variants of the
+        // historical CHECK(id=1) tables are still recognised.
+        const QString accountSql = [&] {
+            QSqlQuery q(database);
+            QString sql;
+            if (q.exec("SELECT sql FROM sqlite_master WHERE type='table' AND name='account'") &&
+                q.next())
+                sql = q.value(0).toString();
+            sql.remove(QChar(' '));
+            return sql;
+        }();
+        legacyAccount = accountSql.contains(QLatin1String("CHECK(id=1)"));
+        if (legacyAccount) {
+            if (!database.transaction()) {
+                if (error)
+                    *error = database.lastError().text();
+                return false;
+            }
+            auto rebuildFail = [&](const QString &why) {
+                database.rollback();
+                if (error)
+                    *error = why;
+                return false;
+            };
+            QSqlQuery build(database);
+            if (!build.exec("CREATE TABLE account_new ("
+                            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                            " fingerprint TEXT NOT NULL UNIQUE,"
+                            " nickname TEXT NOT NULL,"
+                            " ed25519_pub BLOB NOT NULL,"
+                            " x25519_pub BLOB NOT NULL,"
+                            " keystore_blob BLOB NOT NULL,"
+                            " cert_pem TEXT NOT NULL,"
+                            " created_ts INTEGER NOT NULL)"))
+                return rebuildFail(build.lastError().text());
+            if (!build.exec("INSERT INTO account_new (id,fingerprint,nickname,ed25519_pub,"
+                            "x25519_pub,keystore_blob,cert_pem,created_ts)"
+                            " SELECT id,fingerprint,nickname,ed25519_pub,x25519_pub,"
+                            "keystore_blob,cert_pem,created_ts FROM account"))
+                return rebuildFail(build.lastError().text());
+            if (!build.exec("DROP TABLE account"))
+                return rebuildFail(build.lastError().text());
+            if (!build.exec("ALTER TABLE account_new RENAME TO account"))
+                return rebuildFail(build.lastError().text());
+            if (!build.exec("CREATE TABLE profile_new ("
+                            " account_id INTEGER PRIMARY KEY,"
+                            " avatar_path TEXT, avatar_hash TEXT, lan_ip TEXT)"))
+                return rebuildFail(build.lastError().text());
+            if (!build.exec("INSERT INTO profile_new (account_id,avatar_path,avatar_hash,lan_ip)"
+                            " SELECT id,avatar_path,avatar_hash,lan_ip FROM profile"))
+                return rebuildFail(build.lastError().text());
+            if (!build.exec("DROP TABLE profile"))
+                return rebuildFail(build.lastError().text());
+            if (!build.exec("ALTER TABLE profile_new RENAME TO profile"))
+                return rebuildFail(build.lastError().text());
+            if (!database.commit())
+                return rebuildFail(database.lastError().text());
+        }
+    }
+
+    // Rooms are per-identity: tag the owning local account so multiple local
+    // accounts never see each other's rooms.
+    bool columnAdded = false;
+    if (!tableHasColumn(database, "rooms", "owner_fp")) {
+        QSqlQuery alter(database);
+        if (!alter.exec("ALTER TABLE rooms ADD COLUMN owner_fp TEXT")) {
+            if (error)
+                *error = alter.lastError().text();
+            return false;
+        }
+        columnAdded = true;
+    }
+    // Pre-multi-account databases held exactly one identity; every legacy room
+    // belongs to it. Backfill after the schema conversion and whenever an
+    // account-table rebuild ran, so rooms with a NULL/empty owner are claimed.
+    if (columnAdded || legacyAccount) {
+        QSqlQuery backfill(database);
+        if (!backfill.exec("UPDATE rooms SET owner_fp=(SELECT fingerprint FROM account LIMIT 1)"
+                           " WHERE owner_fp IS NULL OR owner_fp=''")) {
+            if (error)
+                *error = backfill.lastError().text();
+            return false;
+        }
+    }
+
     // Collect legacy rooms first: SQLite does not like updating a table while a
     // cursor over the same table is still open.
     QVector<QPair<QString, QString>> rekeys; // old room id -> new 32-hex id
@@ -253,7 +377,7 @@ bool Storage::migrate(QString *error) {
             }
             if (newId.isEmpty()) {
                 if (error)
-                    *error = QStringLiteral("无法为旧聊天室 %1 生成新的 32 位指纹 ID").arg(oldId);
+                    *error = QCoreApplication::translate("Storage", "Could not generate a new 32-hex fingerprint id for the old room %1").arg(oldId);
                 return false;
             }
             rekeys.append({oldId, newId});
@@ -304,7 +428,7 @@ bool Storage::migrate(QString *error) {
     for (const auto &roomId : roomsWithoutCode) {
         const QString code = freshInviteCode(database);
         if (code.isEmpty())
-            return fail(QStringLiteral("无法生成唯一邀请码"));
+            return fail(QCoreApplication::translate("Storage", "Could not generate a unique invite code"));
         QSqlQuery q(database);
         q.prepare("UPDATE rooms SET invite_code=? WHERE room_id=?");
         q.addBindValue(code);
@@ -325,40 +449,69 @@ bool Storage::migrate(QString *error) {
 bool Storage::wipeAccount(const QString &fp, bool alsoChatHistoryAndFiles, QString *error) {
     if (!exec("BEGIN TRANSACTION", error))
         return false;
-    // 1) optional: full local session data (UC-02 step 6, user's choice).
-    //    Done FIRST so subqueries on membership rows still see them.
-    if (alsoChatHistoryAndFiles) {
-        for (const char *t : {"messages", "rooms", "members", "blacklist", "file_announce",
-                              "suppliers", "chunk_progress", "downloads", "local_files"}) {
-            if (!exec(QString("DELETE FROM %1").arg(t), error)) {
-                exec("ROLLBACK");
-                return false;
-            }
-        }
-    } else {
-        // keep history/room structure, but drop *this identity's* membership rows
-        QSqlQuery q = query("DELETE FROM members WHERE fingerprint=?");
-        q.bindValue(0, fp);
+    // Parameterized single-bind DELETE helper (exec() cannot bind values).
+    auto del = [&](const QString &sql, const QString &bind, QString *why) {
+        QSqlQuery q = query(sql);
+        q.bindValue(0, bind);
         if (!q.exec()) {
-            if (error)
-                *error = q.lastError().text();
-            exec("ROLLBACK");
+            if (why)
+                *why = QStringLiteral("%1 -> %2").arg(sql, q.lastError().text());
             return false;
         }
-    }
-    // 2) identity material (UC-02 step 5/6).
-    QSqlQuery q = query("DELETE FROM account WHERE fingerprint=?");
-    q.bindValue(0, fp);
-    bool ok = q.exec();
-    if (!ok && error)
-        *error = q.lastError().text();
-    ok = ok && exec("DELETE FROM profile", error);
-    ok = ok && exec("DELETE FROM peers", error);      // dynamic list, rebuilds itself
-    ok = ok && exec("DELETE FROM tofu", error);       // old identity's pins are useless now
-    ok = ok && exec("COMMIT", error);
-    if (!ok)
+        return true;
+    };
+    auto fail = [&](const QString &why) {
         exec("ROLLBACK");
-    return ok;
+        if (error)
+            *error = why;
+        return false;
+    };
+    // 1) optional: this identity's room data (UC-02 step 6, user's choice).
+    //    Multi-account: scope every delete by rooms.owner_fp so other local
+    //    identities keep their rooms, history and downloads.
+    if (alsoChatHistoryAndFiles) {
+        QString why;
+        const QString scoped = QStringLiteral(
+            "DELETE FROM %1 WHERE room_id IN (SELECT room_id FROM rooms WHERE owner_fp=?)");
+        // room_prefs first; the rest of the subqueries reference rooms itself.
+        if (!del(scoped.arg(QStringLiteral("room_prefs")), fp, &why))
+            return fail(why);
+        // suppliers/chunk_progress carry no room_id: wipe by provider identity
+        // and prune progress rows whose download task is gone.
+        if (!del(QStringLiteral("DELETE FROM suppliers WHERE fingerprint=?"), fp, &why))
+            return fail(why);
+        for (const char *t : {"members", "blacklist", "approvals", "file_announce",
+                              "downloads", "messages"}) {
+            if (!del(scoped.arg(QLatin1String(t)), fp, &why))
+                return fail(why);
+        }
+        if (!exec(QStringLiteral("DELETE FROM chunk_progress WHERE file_hash NOT IN"
+                                 " (SELECT file_hash FROM downloads)"),
+                  &why))
+            return fail(why);
+        if (!del(QStringLiteral("DELETE FROM rooms WHERE owner_fp=?"), fp, &why))
+            return fail(why);
+        // the finished-file index is content-addressed, not identity-scoped
+        if (!exec("DELETE FROM local_files", &why))
+            return fail(why);
+    } else {
+        // keep history/room structure, but drop *this identity's* membership rows
+        if (!del(QStringLiteral("DELETE FROM members WHERE fingerprint=?"), fp, error))
+            return fail(*error);
+    }
+    // 2) identity material (UC-02 step 5/6). Profile first (it references the
+    //    account row); peers/tofu are peer-side caches that rebuild themselves
+    //    and stay valid for other local accounts.
+    QString why2;
+    if (!del(QStringLiteral("DELETE FROM profile WHERE account_id IN"
+                            " (SELECT id FROM account WHERE fingerprint=?)"),
+             fp, &why2))
+        return fail(why2);
+    if (!del(QStringLiteral("DELETE FROM account WHERE fingerprint=?"), fp, &why2))
+        return fail(why2);
+    if (!exec("COMMIT", error))
+        return fail(*error);
+    return true;
 }
 
 } // namespace meshlink
