@@ -5,8 +5,14 @@
 
 #include <QWidget>
 
+#include <dtkwidget_global.h>
+
 class QLabel;
-class QLineEdit;
+
+DWIDGET_BEGIN_NAMESPACE
+class DComboBox;
+class DLineEdit;
+DWIDGET_END_NAMESPACE
 
 namespace meshlink {
 
@@ -15,7 +21,7 @@ class Engine;
 class ProfilePage : public QWidget {
     Q_OBJECT
 public:
-    ProfilePage(Engine *engine, QWidget *parent = nullptr);
+    explicit ProfilePage(Engine *engine, QWidget *parent = nullptr);
 
 signals:
     void accountDestroyed();
@@ -24,13 +30,17 @@ private:
     void load();
     void save();
     void destroyAccount();
+    void chooseAvatar();
+    void randomAvatar();
+    void refreshAccounts();
+    void onAccountComboChanged(int index);
 
     Engine *m_engine;
     QLabel *m_avatar = nullptr;
-    QLineEdit *m_nick = nullptr;
-    QLabel *m_fp = nullptr;
-    QLabel *m_ip = nullptr;
-    QLabel *m_status = nullptr;
+    DTK_WIDGET_NAMESPACE::DLineEdit *m_nick = nullptr;
+    DTK_WIDGET_NAMESPACE::DLineEdit *m_fp = nullptr;
+    DTK_WIDGET_NAMESPACE::DLineEdit *m_ip = nullptr;
+    DTK_WIDGET_NAMESPACE::DComboBox *m_accountCombo = nullptr;
     QString m_pendingAvatar; // chosen file, applied on save
 };
 

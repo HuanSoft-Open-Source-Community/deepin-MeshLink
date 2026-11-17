@@ -9,9 +9,11 @@
 
 #include <QVector>
 
-class QLineEdit;
-class QLabel;
-class QComboBox;
+DWIDGET_BEGIN_NAMESPACE
+class DComboBox;
+class DLineEdit;
+class DTipLabel;
+DWIDGET_END_NAMESPACE
 
 namespace meshlink {
 
@@ -26,6 +28,9 @@ public:
     static bool ensureAccount(Engine *engine, QWidget *parent);
     // UC-01 A1 recovery: existing keystore unreadable -> explicit rebuild (A2).
     static bool runAsRecovery(Engine *engine, QWidget *parent);
+    // Multi-account: create an additional identity (never destroys accounts)
+    // and switch the engine to it.
+    static bool createAdditionalAccount(Engine *engine, QWidget *parent);
 
 private:
     void createAccount();
@@ -33,9 +38,10 @@ private:
     LanSegment selectedSegment() const;
 
     Engine *m_engine;
-    QLineEdit *m_nick = nullptr;
-    QComboBox *m_segments = nullptr;
-    QLabel *m_error = nullptr;
+    bool m_addMode = false;
+    DTK_WIDGET_NAMESPACE::DLineEdit *m_nick = nullptr;
+    DTK_WIDGET_NAMESPACE::DComboBox *m_segments = nullptr;
+    DTK_WIDGET_NAMESPACE::DTipLabel *m_error = nullptr;
     QVector<LanSegment> m_segmentList;
 };
 

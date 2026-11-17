@@ -1,0 +1,221 @@
+{
+    "groups": [
+        {
+            "key": "network",
+            "name": "Network",
+            "groups": [
+                {
+                    "key": "discovery",
+                    "name": "Discovery",
+                    "options": [
+                        {
+                            "key": "lanSegment",
+                            "name": "LAN segment",
+                            "type": "meshlink-lan-segment",
+                            "default": ""
+                        },
+                        {
+                            "key": "hint",
+                            "type": "title2",
+                            "default": "The LAN segment, heartbeat and offline threshold changes apply immediately."
+                        },
+                        {
+                            "key": "udpPort",
+                            "name": "UDP discovery port",
+                            "type": "spinbutton",
+                            "min": 1024,
+                            "max": 65535,
+                            "default": 2425
+                        },
+                        {
+                            "key": "heartbeat",
+                            "name": "Heartbeat interval (ms)",
+                            "type": "spinbutton",
+                            "min": 500,
+                            "max": 60000,
+                            "default": 3000
+                        },
+                        {
+                            "key": "offline",
+                            "name": "Offline threshold (heartbeat periods)",
+                            "type": "spinbutton",
+                            "min": 2,
+                            "max": 10,
+                            "default": 3
+                        }
+                    ]
+                },
+                {
+                    "key": "tls",
+                    "name": "TLS service",
+                    "options": [
+                        {
+                            "key": "hint",
+                            "type": "title2",
+                            "default": "Port changes take effect after restarting deepin-MeshLink."
+                        },
+                        {
+                            "key": "port",
+                            "name": "TLS service port",
+                            "type": "spinbutton",
+                            "min": 1024,
+                            "max": 65535,
+                            "default": 2426
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "key": "interface",
+            "name": "Interface",
+            "groups": [
+                {
+                    "key": "sidebar",
+                    "name": "Sidebar",
+                    "options": [
+                        {
+                            "key": "hideNavLabels",
+                            "type": "checkbox",
+                            "text": "Hide navigation labels",
+                            "default": false
+                        }
+                    ]
+                },
+                {
+                    "key": "chat",
+                    "name": "Chat",
+                    "options": [
+                        {
+                            "key": "sendKey",
+                            "name": "Send shortcut",
+                            "type": "combobox",
+                            "default": "enter",
+                            "items": {
+                                "keys": [
+                                    "enter",
+                                    "ctrlEnter"
+                                ],
+                                "values": [
+                                    "Enter",
+                                    "Ctrl+Enter"
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "key": "behavior",
+            "name": "Behavior",
+            "groups": [
+                {
+                    "key": "window",
+                    "name": "Window and tray",
+                    "options": [
+                        {
+                            "key": "enableTray",
+                            "type": "checkbox",
+                            "text": "Show the XDG tray icon (StatusNotifierItem)",
+                            "default": true
+                        },
+                        {
+                            "key": "closeAction",
+                            "name": "When closing the window",
+                            "type": "combobox",
+                            "default": "ask",
+                            "items": {
+                                "keys": [
+                                    "ask",
+                                    "minimize",
+                                    "exit"
+                                ],
+                                "values": [
+                                    "Ask every time",
+                                    "Minimize to the tray",
+                                    "Exit the application"
+                                ]
+                            }
+                        },
+                        {
+                            "key": "hint",
+                            "type": "title2",
+                            "default": "Minimizing keeps deepin-MeshLink resident so messages still arrive."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "key": "notifications",
+            "name": "Notifications",
+            "groups": [
+                {
+                    "key": "general",
+                    "name": "Desktop notifications",
+                    "options": [
+                        {
+                            "key": "enabled",
+                            "type": "checkbox",
+                            "text": "Enable desktop notifications (XDG message system)",
+                            "default": true
+                        },
+                        {
+                            "key": "preview",
+                            "type": "checkbox",
+                            "text": "Show message previews in notifications",
+                            "default": true
+                        },
+                        {
+                            "key": "hint",
+                            "type": "title2",
+                            "default": "Rooms set to do-not-disturb stay quiet unless someone @-mentions you."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "key": "files",
+            "name": "Files",
+            "groups": [
+                {
+                    "key": "downloads",
+                    "name": "Download defaults",
+                    "options": [
+                        {
+                            "key": "hint",
+                            "type": "title2",
+                            "default": "Chunk size and threads apply to new downloads; history limit to snapshots."
+                        },
+                        {
+                            "key": "chunkKb",
+                            "name": "Chunk size (KiB)",
+                            "type": "spinbutton",
+                            "min": 64,
+                            "max": 1024,
+                            "default": 256
+                        },
+                        {
+                            "key": "threads",
+                            "name": "Parallel download threads",
+                            "type": "spinbutton",
+                            "min": 1,
+                            "max": 16,
+                            "default": 4
+                        },
+                        {
+                            "key": "history",
+                            "name": "Snapshot message limit",
+                            "type": "spinbutton",
+                            "min": 20,
+                            "max": 1000,
+                            "default": 200
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

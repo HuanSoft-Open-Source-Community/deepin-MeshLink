@@ -27,7 +27,7 @@ option(MESHLINK_BUILD_TESTS "Build MeshLink self-tests" ON)
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network Sql Concurrent)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network Sql Concurrent DBus)
 find_package(Dtk6 REQUIRED COMPONENTS Core Gui Widget)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto SSL)
 
@@ -36,6 +36,15 @@ if(DEFINED OpenSSL_VERSION AND NOT OpenSSL_VERSION STREQUAL "" AND OpenSSL_VERSI
 endif()
 
 message(STATUS "MeshLink: Qt ${Qt6_VERSION}, DTK ${Dtk6_VERSION}, OpenSSL ${OpenSSL_VERSION}")
+
+# Host/cross toolchains may need an emulator wrapper for the Qt host tools
+# (rcc/lrelease). Empty by default so native deepin builds are untouched.
+set(MESHLINK_RCC_EXECUTABLE "" CACHE FILEPATH
+    "Optional rcc wrapper/emulator for cross or sandbox builds")
+if(MESHLINK_RCC_EXECUTABLE AND TARGET Qt6::rcc)
+    set_target_properties(Qt6::rcc PROPERTIES
+        IMPORTED_LOCATION "${MESHLINK_RCC_EXECUTABLE}")
+endif()
 
 # Debian multiarch: opensslconf.h lives under /usr/include/<triplet>/openssl.
 # (Also needed with mirrored host toolchains, e.g. /opt/host-tools/usr/include.)
@@ -70,6 +79,7 @@ set(CORE_SOURCES
 set(CORE_HEADERS
     src/core/common.h
     src/core/crypto.h
+    src/core/notifypolicy.h
     src/core/protocol.h
     src/core/account.h
     src/core/storage.h
@@ -100,11 +110,12 @@ target_compile_definitions(meshlink_core PUBLIC
     MESHLINK_STAGE="alpha")
 
 # ---------------------------------------------------------------------------
-# deepin-meshlink : the DTK6 GUI application
+# meshlink_ui : DTK6 pages shared by the application and the UI smoke test.
 # ---------------------------------------------------------------------------
 option(MESHLINK_BUILD_GUI "Build the DTK6 GUI application" ON)
 if(MESHLINK_BUILD_GUI)
 set(UI_SOURCES
+    src/ui/uiutils.cpp
     src/ui/appicon.cpp
     src/ui/mainwindow.cpp
     src/ui/profilepage.cpp
@@ -112,10 +123,15 @@ set(UI_SOURCES
     src/ui/chatview.cpp
     src/ui/discoverview.cpp
     src/ui/transfersview.cpp
-    src/ui/settingsview.cpp
+    src/ui/settingsdialog.cpp
+    src/ui/settingsi18n.cpp
     src/ui/firststartwizard.cpp
+    src/ui/xdgnotifications.cpp
+    src/ui/notificationcenter.cpp
+    src/ui/xdgtrayicon.cpp
 )
 set(UI_HEADERS
+    src/ui/uiutils.h
     src/ui/appicon.h
     src/ui/mainwindow.h
     src/ui/profilepage.h
@@ -123,26 +139,57 @@ set(UI_HEADERS
     src/ui/chatview.h
     src/ui/discoverview.h
     src/ui/transfersview.h
-    src/ui/settingsview.h
+    src/ui/settingsdialog.h
     src/ui/firststartwizard.h
+    src/ui/xdgnotifications.h
+    src/ui/notificationcenter.h
+    src/ui/xdgtrayicon.h
 )
 
-add_executable(deepin-meshlink src/app/main.cpp ${UI_SOURCES} ${UI_HEADERS})
-target_link_libraries(deepin-meshlink PRIVATE meshlink_core Dtk6::Widget Dtk6::Gui Qt6::Widgets)
-endif()
+add_library(meshlink_ui STATIC ${UI_SOURCES} ${UI_HEADERS})
+target_link_libraries(meshlink_ui PUBLIC
+    meshlink_core Dtk6::Widget Dtk6::Gui Qt6::Widgets Qt6::DBus)
+target_include_directories(meshlink_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # ---------------------------------------------------------------------------
-# Tests
+# deepin-meshlink : the DTK6 executable
 # ---------------------------------------------------------------------------
-if(MESHLINK_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
-endif()
+add_executable(deepin-meshlink src/app/main.cpp)
+target_link_libraries(deepin-meshlink PRIVATE meshlink_ui)
+
+qt6_add_resources(deepin-meshlink "meshlink_settings"
+    PREFIX "/"
+    BASE "${CMAKE_CURRENT_SOURCE_DIR}/resources"
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/resources/settings/meshlink-settings.json")
 
 # ---------------------------------------------------------------------------
-# Install (used by debian/rules via `dh $@ --buildsystem=cmake`)
+# Translations: English source strings + zh_CN language pack.
+# `update_translations` refreshes the .ts; normal builds only run lrelease.
 # ---------------------------------------------------------------------------
-if(MESHLINK_BUILD_GUI)
+find_package(Qt6 REQUIRED COMPONENTS LinguistTools)
+# Host/cross toolchains may need an emulator wrapper for Qt's lrelease binary
+# (the sandbox uses the host loader). Empty by default for native builds.
+set(MESHLINK_LRELEASE_EXECUTABLE "" CACHE FILEPATH
+    "Optional lrelease wrapper/emulator for cross or sandbox builds")
+if(MESHLINK_LRELEASE_EXECUTABLE)
+    set_target_properties(Qt6::lrelease PROPERTIES
+        IMPORTED_LOCATION "${MESHLINK_LRELEASE_EXECUTABLE}")
+endif()
+set(MESHLINK_TS_FILES "${CMAKE_CURRENT_SOURCE_DIR}/translations/deepin-meshlink_zh_CN.ts")
+qt6_add_lupdate(TS_FILES ${MESHLINK_TS_FILES}
+    SOURCE_TARGETS deepin-meshlink meshlink_ui meshlink_core)
+qt6_add_lrelease(TS_FILES ${MESHLINK_TS_FILES}
+    LRELEASE_TARGET meshlink_lrelease
+    QM_FILES_OUTPUT_VARIABLE MESHLINK_QM_FILES)
+add_dependencies(deepin-meshlink meshlink_lrelease)
+
+if(MESHLINK_QM_FILES)
+    add_custom_command(TARGET deepin-meshlink POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/translations"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${MESHLINK_QM_FILES} "${CMAKE_BINARY_DIR}/translations/")
+endif()
+
 install(TARGETS deepin-meshlink RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES resources/cn.org.huansoft.deepin-meshlink.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
@@ -152,4 +199,16 @@ install(DIRECTORY resources/icons/
 install(FILES resources/meshlink.png
         DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/256x256/apps
         RENAME cn.org.huansoft.deepin-meshlink.png)
+if(MESHLINK_QM_FILES)
+    install(FILES ${MESHLINK_QM_FILES}
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/deepin-meshlink/translations)
+endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+if(MESHLINK_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
 endif()

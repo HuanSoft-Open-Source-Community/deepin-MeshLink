@@ -8,86 +8,172 @@
 #include "core/lansegment.h"
 #include "core/roommanager.h"
 #include "core/settings.h"
+#include "uiutils.h"
 
 #include <DDialog>
+#include <DFontSizeManager>
+#include <DFrame>
+#include <DLabel>
+#include <DLineEdit>
+#include <DMessageManager>
+#include <DPaletteHelper>
+#include <DPushButton>
+#include <DSuggestButton>
+#include <dinputdialog.h>
 
-#include <QHBoxLayout>
 #include <QHeaderView>
-#include <QInputDialog>
-#include <QLabel>
-#include <QLineEdit>
-#include <QMessageBox>
-#include <QPushButton>
-#include <QTableWidget>
+#include <QHostAddress>
+#include <QHBoxLayout>
+#include <QPointer>
+#include <QRegularExpression>
+#include <QRegularExpressionValidator>
+#include <QStandardItem>
+#include <QStandardItemModel>
+#include <QTableView>
+#include <QTimer>
 #include <QVBoxLayout>
 
 DWIDGET_USE_NAMESPACE
+DGUI_USE_NAMESPACE
 
 namespace meshlink {
+namespace {
+
+DLabel *sectionLabel(const QString &text, QWidget *parent) {
+    auto *label = new DLabel(text, parent);
+    label->setForegroundRole(DPalette::TextTitle);
+    DFontSizeManager::instance()->bind(label, DFontSizeManager::T5, QFont::DemiBold);
+    return label;
+}
+
+} // namespace
 
 DiscoverView::DiscoverView(Engine *engine, QWidget *parent) : QWidget(parent), m_engine(engine) {
     auto *root = new QVBoxLayout(this);
-    root->setContentsMargins(16, 16, 16, 16);
+    root->setContentsMargins(24, 20, 24, 20);
+    root->setSpacing(14);
 
-    // ---- UC-04: current LAN segment + live nodes ----
-    m_segment = new QLabel(this);
-    root->addWidget(m_segment);
-    root->addWidget(new QLabel(QStringLiteral("<b>局域网节点</b>（自动发现；超过离线阈值未再见则置灰）"), this));
-    m_peers = new QTableWidget(0, 5, this);
-    m_peers->setHorizontalHeaderLabels({QStringLiteral("昵称"), QStringLiteral("指纹"), QStringLiteral("IPv4"),
-                                        QStringLiteral("TLS 端口"), QStringLiteral("状态")});
+    auto *create = new DSuggestButton(tr("Create room"), this);
+    create->setObjectName(QStringLiteral("discoverView.createRoomButton"));
+    create->setIcon(UiUtils::icon(QStringLiteral("list-add")));
+    connect(create, &DSuggestButton::clicked, this, &DiscoverView::createRoomHere);
+    root->addWidget(UiUtils::pageHeader(tr("Discover"), create, this));
+
+    // ---- current LAN segment ----
+    auto *segmentCard = new DFrame(this);
+    segmentCard->setLineWidth(1);
+    auto *segmentLayout = new QHBoxLayout(segmentCard);
+    segmentLayout->setContentsMargins(12, 10, 12, 10);
+    segmentLayout->setSpacing(10);
+    const QIcon networkIcon = UiUtils::icon(QStringLiteral("network-wired"),
+                                            QStringLiteral("network-workgroup"));
+    auto *segmentIcon = new QLabel(segmentCard);
+    if (!networkIcon.isNull())
+        segmentIcon->setPixmap(networkIcon.pixmap(24, 24));
+    else
+        segmentIcon->hide();
+    m_segment = new DLabel(segmentCard);
+    m_segment->setWordWrap(true);
+    m_segment->setForegroundRole(DPalette::TextTips);
+    auto *change = new DPushButton(tr("Change…"), segmentCard);
+    connect(change, &DPushButton::clicked, this, [this] {
+        emit settingsRequested(QStringLiteral("network.discovery"));
+    });
+    segmentLayout->addWidget(segmentIcon);
+    segmentLayout->addWidget(m_segment, 1);
+    segmentLayout->addWidget(change);
+    root->addWidget(segmentCard);
+
+    // ---- peers ----
+    root->addWidget(sectionLabel(tr("LAN nodes"), this));
+    m_peers = new QTableView(this);
+    m_peers->setObjectName(QStringLiteral("discoverView.peersTable"));
+    UiUtils::setupTable(m_peers);
+    m_peerModel = new QStandardItemModel(0, 5, this);
+    m_peerModel->setHorizontalHeaderLabels(
+        {tr("Nickname"), tr("Fingerprint"), tr("IPv4"), tr("TLS port"), tr("Status")});
+    m_peers->setModel(m_peerModel);
     m_peers->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    m_peers->verticalHeader()->setVisible(false);
-    m_peers->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    for (int column = 1; column < 5; ++column)
+        m_peers->horizontalHeader()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+    m_peers->setMinimumHeight(130);
     root->addWidget(m_peers, 1);
 
-    auto *boot = new QHBoxLayout;
-    auto *bootEdit = new QLineEdit(this);
-    bootEdit->setPlaceholderText(QStringLiteral("广播被防火墙阻断时：手动添加节点 IP（UC-04 E2）"));
-    auto *bootAdd = new QPushButton(QStringLiteral("添加"), this);
-    connect(bootAdd, &QPushButton::clicked, this, [this, bootEdit] {
+    // ---- joinable rooms ----
+    auto *roomsHeader = new QHBoxLayout;
+    roomsHeader->setContentsMargins(0, 0, 0, 0);
+    roomsHeader->setSpacing(8);
+    roomsHeader->addWidget(sectionLabel(tr("Joinable rooms"), this));
+    roomsHeader->addStretch(1);
+    auto *join = new DPushButton(tr("Join selected"), this);
+    connect(join, &DPushButton::clicked, this, &DiscoverView::joinSelected);
+    roomsHeader->addWidget(join);
+    root->addLayout(roomsHeader);
+
+    m_rooms = new QTableView(this);
+    m_rooms->setObjectName(QStringLiteral("discoverView.roomsTable"));
+    UiUtils::setupTable(m_rooms);
+    m_roomModel = new QStandardItemModel(0, 6, this);
+    m_roomModel->setHorizontalHeaderLabels({tr("Room"), tr("Invite code"), tr("Room fingerprint"),
+                                            tr("Members"), tr("Policy"), tr("Host")});
+    m_rooms->setModel(m_roomModel);
+    m_rooms->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    for (int column = 1; column < 6; ++column)
+        m_rooms->horizontalHeader()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+    m_rooms->setMinimumHeight(130);
+    root->addWidget(m_rooms, 1);
+
+    // ---- join by invite code ----
+    auto *codeRow = new QHBoxLayout;
+    codeRow->setContentsMargins(0, 0, 0, 0);
+    codeRow->setSpacing(8);
+    m_inviteCode = new DLineEdit(this);
+    m_inviteCode->setObjectName(QStringLiteral("discoverView.inviteEdit"));
+    m_inviteCode->setPlaceholderText(tr("Enter the 6-digit invite code"));
+    m_inviteCode->lineEdit()->setMaxLength(kInviteCodeDigits);
+    m_inviteCode->setInputMethodHints(Qt::ImhDigitsOnly);
+    m_inviteCode->lineEdit()->setValidator(
+        new QRegularExpressionValidator(QRegularExpression(QStringLiteral("\\d{0,6}")), m_inviteCode));
+    auto *joinByCode = new DPushButton(tr("Join by invite code"), this);
+    joinByCode->setObjectName(QStringLiteral("discoverView.joinByCodeButton"));
+    connect(joinByCode, &DPushButton::clicked, this, &DiscoverView::joinByInviteCode);
+    codeRow->addWidget(m_inviteCode, 1);
+    codeRow->addWidget(joinByCode);
+    root->addLayout(codeRow);
+
+    // ---- manual bootstrap ----
+    auto *bootstrapHint = new DLabel(
+        tr("Broadcast blocked? Add a node IP as a unicast discovery target."), this);
+    bootstrapHint->setForegroundRole(DPalette::TextTips);
+    root->addWidget(bootstrapHint);
+
+    auto *bootRow = new QHBoxLayout;
+    bootRow->setContentsMargins(0, 0, 0, 0);
+    bootRow->setSpacing(8);
+    auto *bootEdit = new DLineEdit(this);
+    bootEdit->setPlaceholderText(tr("Node IPv4 address"));
+    auto *bootAdd = new DPushButton(tr("Add"), this);
+    connect(bootAdd, &DPushButton::clicked, this, [this, bootEdit] {
         const QString ip = bootEdit->text().trimmed();
-        if (ip.isEmpty())
+        const QHostAddress address(ip);
+        if (address.protocol() != QAbstractSocket::IPv4Protocol) {
+            bootEdit->setAlert(true);
+            bootEdit->showAlertMessage(tr("Enter a valid IPv4 address."));
             return;
+        }
         m_engine->settings()->addBootstrapTarget(ip, m_engine->settings()->discoveryPort());
         m_engine->discovery()->addManualTarget(ip, m_engine->settings()->discoveryPort());
         bootEdit->clear();
+        bootEdit->setAlert(false);
+        DMessageManager::instance()->sendMessage(
+            this, UiUtils::icon(QStringLiteral("dialog-ok")),
+            tr("Discovery target added: %1").arg(ip));
     });
-    boot->addWidget(bootEdit);
-    boot->addWidget(bootAdd);
-    root->addLayout(boot);
-
-    // ---- UC-05/06: joinable rooms (from peer heartbeats) ----
-    root->addWidget(new QLabel(QStringLiteral("<b>可加入的聊天室</b>（随心跳广播到达，最多 8 间/节点）"), this));
-    m_rooms = new QTableWidget(0, 6, this);
-    m_rooms->setHorizontalHeaderLabels({QStringLiteral("房间名"), QStringLiteral("邀请码"), QStringLiteral("房间指纹"),
-                                        QStringLiteral("成员"), QStringLiteral("策略"), QStringLiteral("托管者")});
-    m_rooms->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    m_rooms->verticalHeader()->setVisible(false);
-    m_rooms->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    m_rooms->setSelectionBehavior(QAbstractItemView::SelectRows);
-    root->addWidget(m_rooms, 1);
-
-    auto *codeRow = new QHBoxLayout;
-    m_inviteCode = new QLineEdit(this);
-    m_inviteCode->setMaxLength(kInviteCodeDigits);
-    m_inviteCode->setPlaceholderText(QStringLiteral("输入 6 位数字邀请码"));
-    auto *codeJoin = new QPushButton(QStringLiteral("按邀请码加入"), this);
-    connect(codeJoin, &QPushButton::clicked, this, &DiscoverView::joinByInviteCode);
-    codeRow->addWidget(m_inviteCode);
-    codeRow->addWidget(codeJoin);
-    codeRow->addStretch();
-    root->addLayout(codeRow);
-
-    auto *row = new QHBoxLayout;
-    auto *join = new QPushButton(QStringLiteral("加入所选聊天室"), this);
-    connect(join, &QPushButton::clicked, this, &DiscoverView::joinSelected);
-    auto *create = new QPushButton(QStringLiteral("创建聊天室…"), this);
-    connect(create, &QPushButton::clicked, this, &DiscoverView::createRoomHere); // UC-05
-    row->addWidget(join);
-    row->addWidget(create);
-    row->addStretch();
-    root->addLayout(row);
+    connect(bootEdit->lineEdit(), &QLineEdit::textChanged, bootEdit,
+            [bootEdit] { bootEdit->setAlert(false); });
+    bootRow->addWidget(bootEdit, 1);
+    bootRow->addWidget(bootAdd);
+    root->addLayout(bootRow);
 
     connect(m_engine->discovery(), &Discovery::peerSeen, this, [this] { refreshPeers(); refreshRooms(); });
     connect(m_engine->discovery(), &Discovery::peerGone, this, [this] { refreshPeers(); refreshRooms(); });
@@ -100,56 +186,67 @@ DiscoverView::DiscoverView(Engine *engine, QWidget *parent) : QWidget(parent), m
 
 void DiscoverView::refreshSegment() {
     const LanSegment segment = m_engine->lanSegment();
-    m_segment->setText(QStringLiteral("<b>当前网段</b>：%1（只接受该网段内的心跳；可在“设置”中随时切换）")
-                           .arg(segment.label()));
+    m_segment->setText(segment.isValid() ? tr("Current segment: %1").arg(segment.label())
+                                         : tr("No usable IPv4 segment is selected."));
+    m_segment->setToolTip(tr("Heartbeats are broadcast into and accepted only from this segment."));
 }
 
 void DiscoverView::refreshPeers() {
-    const auto peers = m_engine->discovery()->peers();
-    m_peers->setRowCount(peers.size());
-    for (int i = 0; i < peers.size(); ++i) {
-        const auto &p = peers[i];
-        m_peers->setItem(i, 0, new QTableWidgetItem(p.nickname));
-        m_peers->setItem(i, 1, new QTableWidgetItem(p.fingerprint.left(16) + "…"));
-        m_peers->setItem(i, 2, new QTableWidgetItem(p.ip));
-        m_peers->setItem(i, 3, new QTableWidgetItem(QString::number(p.tcpPort)));
-        auto *st = new QTableWidgetItem(p.online ? QStringLiteral("在线") : QStringLiteral("离线"));
-        if (!p.online)
-            st->setForeground(Qt::gray); // E1: grey, never silently drop (UC-03)
-        m_peers->setItem(i, 4, st);
+    const QVector<PeerInfo> peers = m_engine->discovery()->peers();
+    m_peerModel->setRowCount(peers.size());
+    const QColor tips = DPaletteHelper::instance()->palette(m_peers).color(DPalette::TextTips);
+    for (int row = 0; row < peers.size(); ++row) {
+        const PeerInfo &peer = peers.at(row);
+        m_peerModel->setItem(row, 0, new QStandardItem(peer.nickname));
+        m_peerModel->setItem(row, 1,
+                             new QStandardItem(UiUtils::shortFp(peer.fingerprint, 16)));
+        m_peerModel->setItem(row, 2, new QStandardItem(peer.ip));
+        m_peerModel->setItem(row, 3, new QStandardItem(QString::number(peer.tcpPort)));
+        auto *status = new QStandardItem(peer.online ? tr("Online") : tr("Offline"));
+        if (!peer.online)
+            status->setForeground(tips); // E1: grey, never silently drop (UC-03)
+        m_peerModel->setItem(row, 4, status);
+        m_peerModel->item(row, 1)->setToolTip(peer.fingerprint);
     }
 }
 
 void DiscoverView::refreshRooms() {
-    const auto all = m_engine->discovery()->roomCatalogue();
-    m_rooms->setRowCount(all.size());
-    for (int i = 0; i < all.size(); ++i) {
-        const auto &r = all[i];
+    const QVector<RoomSummary> rooms = m_engine->discovery()->roomCatalogue();
+    m_roomModel->setRowCount(rooms.size());
+    for (int row = 0; row < rooms.size(); ++row) {
+        const RoomSummary &room = rooms.at(row);
         QString host;
-        for (const auto &p : m_engine->discovery()->peers())
-            if (p.fingerprint == r.hostFp)
-                host = p.nickname;
-        auto *name = new QTableWidgetItem(r.name);
-        name->setData(Qt::UserRole, r.roomId);
-        m_rooms->setItem(i, 0, name);
-        auto *code = new QTableWidgetItem(r.inviteCode);
-        code->setToolTip(QStringLiteral("邀请码：%1").arg(r.inviteCode));
-        m_rooms->setItem(i, 1, code);
-        auto *id = new QTableWidgetItem(r.roomId.left(16) + "…");
-        id->setToolTip(r.roomId);
-        m_rooms->setItem(i, 2, id);
-        m_rooms->setItem(i, 3, new QTableWidgetItem(QString::number(r.members)));
-        m_rooms->setItem(i, 4, new QTableWidgetItem(r.policy == JoinPolicy::Approval ? QStringLiteral("需批准")
-                                                                                      : QStringLiteral("自由加入")));
-        m_rooms->setItem(i, 5, new QTableWidgetItem(host.isEmpty() ? r.hostFp.left(12) : host));
+        for (const PeerInfo &peer : m_engine->discovery()->peers()) {
+            if (peer.fingerprint == room.hostFp) {
+                host = peer.nickname;
+                break;
+            }
+        }
+        auto *name = new QStandardItem(room.name);
+        name->setData(room.roomId, Qt::UserRole);
+        m_roomModel->setItem(row, 0, name);
+        auto *code = new QStandardItem(room.inviteCode);
+        code->setToolTip(tr("Invite code: %1").arg(room.inviteCode));
+        m_roomModel->setItem(row, 1, code);
+        auto *fingerprint = new QStandardItem(UiUtils::shortFp(room.roomId, 16));
+        fingerprint->setToolTip(room.roomId);
+        m_roomModel->setItem(row, 2, fingerprint);
+        m_roomModel->setItem(row, 3, new QStandardItem(QString::number(room.members)));
+        m_roomModel->setItem(
+            row, 4,
+            new QStandardItem(room.policy == JoinPolicy::Approval ? tr("Needs approval")
+                                                                : tr("Open")));
+        m_roomModel->setItem(row, 5,
+                             new QStandardItem(host.isEmpty() ? UiUtils::shortFp(room.hostFp, 12)
+                                                              : host));
     }
 }
 
 void DiscoverView::joinSelected() {
-    const int row = m_rooms->currentRow();
-    if (row < 0)
+    const QModelIndex index = m_rooms->currentIndex();
+    if (!index.isValid())
         return;
-    const QString roomId = m_rooms->item(row, 0)->data(Qt::UserRole).toString();
+    const QString roomId = m_roomModel->item(index.row(), 0)->data(Qt::UserRole).toString();
     if (auto summary = m_engine->discovery()->roomById(roomId))
         joinSummary(*summary);
 }
@@ -157,17 +254,21 @@ void DiscoverView::joinSelected() {
 void DiscoverView::joinByInviteCode() {
     const QString code = m_inviteCode->text().trimmed();
     if (code.size() != kInviteCodeDigits) {
-        QMessageBox::warning(this, QStringLiteral("邀请码"), QStringLiteral("邀请码必须是 6 位数字。"));
+        m_inviteCode->setAlert(true);
+        m_inviteCode->showAlertMessage(tr("The invite code must be exactly 6 digits."));
         return;
     }
     QVector<RoomSummary> hits;
-    for (const auto &r : m_engine->discovery()->roomCatalogue())
-        if (r.inviteCode == code)
-            hits.append(r);
+    for (const RoomSummary &room : m_engine->discovery()->roomCatalogue()) {
+        if (room.inviteCode == code)
+            hits.append(room);
+    }
     if (hits.isEmpty()) {
-        QMessageBox::warning(this, QStringLiteral("邀请码"),
-                             QStringLiteral("当前网段未发现该邀请码对应的聊天室。\n"
-                                            "请确认双方在同一网段、聊天室托管节点在线且客户端版本一致。"));
+        UiUtils::warning(
+            this, tr("Invite code"),
+            tr("No room with this invite code was found on the current segment.\n"
+               "Make sure both nodes are on the same segment, the host is online, and both "
+               "clients are up to date."));
         return;
     }
     if (hits.size() == 1) {
@@ -175,30 +276,40 @@ void DiscoverView::joinByInviteCode() {
         return;
     }
     QStringList labels;
-    for (const auto &r : hits)
-        labels << QStringLiteral("%1 · 托管者 %2… · %3 人").arg(r.name, r.hostFp.left(8)).arg(r.members);
+    for (const RoomSummary &room : hits)
+        labels << tr("%1 · host %2 · %3 members")
+                      .arg(room.name, UiUtils::shortFp(room.hostFp, 8))
+                      .arg(room.members);
     bool ok = false;
-    const QString picked = QInputDialog::getItem(this, QStringLiteral("邀请码命中多个聊天室"),
-                                                 QStringLiteral("请选择要加入的聊天室："), labels, 0, false, &ok);
+    const QString picked =
+        DInputDialog::getItem(this, tr("Multiple rooms share this code"),
+                              tr("Choose the room to join:"), labels, 0, false, &ok);
     if (!ok || picked.isEmpty())
         return;
     const int index = labels.indexOf(picked);
     if (index >= 0 && index < hits.size())
-        joinSummary(hits[index]);
+        joinSummary(hits.at(index));
 }
 
 void DiscoverView::joinSummary(const RoomSummary &summary) {
-    auto *d = new DDialog(this);
-    d->setTitle(QStringLiteral("加入聊天室"));
-    d->setMessage(QStringLiteral("正在连接托管节点…"));
-    d->addButton(QStringLiteral("关闭"));
-    d->open();
-    m_engine->rooms()->joinRoom(summary, [d](JoinStatus st, const QString &detail) {
-        // UC-06 outcomes incl. E1 host gone / E2 full / A1 pending approval
-        const QString text = st == JoinStatus::Accepted        ? QStringLiteral("已成功加入")
-                             : st == JoinStatus::PendingApproval ? QStringLiteral("申请已提交，等待托管者批准")
-                             : QStringLiteral("未能加入：%1").arg(detail);
-        d->setMessage(text);
+    auto *dialog = new DDialog(this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setTitle(tr("Join room"));
+    dialog->setMessage(tr("Connecting to the host…"));
+    dialog->addButton(tr("Close"));
+    QPointer<DDialog> guard(dialog);
+    guard->open();
+
+    m_engine->rooms()->joinRoom(summary, [guard](JoinStatus status, const QString &) {
+        // UC-06 outcomes incl. E1 host gone / E2 full / A1 pending approval.
+        // Derive local text from the status; never trust the peer's language.
+        if (!guard)
+            return;
+        guard->setMessage(UiUtils::joinStatusText(status));
+        guard->setIcon(UiUtils::icon(status == JoinStatus::Accepted ||
+                                             status == JoinStatus::PendingApproval
+                                         ? QStringLiteral("dialog-information")
+                                         : QStringLiteral("dialog-warning")));
     });
 }
 

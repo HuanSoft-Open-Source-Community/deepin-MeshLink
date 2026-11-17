@@ -6,107 +6,246 @@
 #include "core/downloader.h"
 #include "core/engine.h"
 #include "core/settings.h"
+#include "uiutils.h"
 
+#include <DFontSizeManager>
+#include <DLabel>
+#include <DPalette>
+#include <DPaletteHelper>
+
+#include <QApplication>
+#include <QCursor>
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QHeaderView>
-#include <QLabel>
 #include <QMenu>
-#include <QProgressBar>
-#include <QPushButton>
-#include <QTableWidget>
+#include <QScrollBar>
+#include <QStackedWidget>
+#include <QStandardItem>
+#include <QStandardItemModel>
+#include <QStyle>
+#include <QStyleOptionProgressBar>
+#include <QStyledItemDelegate>
+#include <QTableView>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
 
+DWIDGET_USE_NAMESPACE
+DGUI_USE_NAMESPACE
+
 namespace meshlink {
+namespace {
 
-TransfersView::TransfersView(Engine *engine, QWidget *parent) : QWidget(parent), m_engine(engine) {
+// Draw the progress column through the active style (chameleon), so it follows
+// the system palette without per-row QProgressBar widgets.
+class ProgressColumnDelegate : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+               const QModelIndex &index) const override {
+        if (index.column() != 1) {
+            QStyledItemDelegate::paint(painter, option, index);
+            return;
+        }
+        QStyleOptionProgressBar bar;
+        bar.rect = option.rect.adjusted(6, 10, -6, -10);
+        bar.minimum = 0;
+        bar.maximum = 100;
+        bar.progress = index.data(Qt::UserRole).toInt();
+        bar.text = QStringLiteral("%1%").arg(bar.progress);
+        bar.textVisible = true;
+        bar.textAlignment = Qt::AlignCenter;
+        bar.state = QStyle::State_Enabled;
+        bar.direction = option.direction;
+        bar.palette = option.palette;
+        bar.fontMetrics = option.fontMetrics;
+        QApplication::style()->drawControl(QStyle::CE_ProgressBar, &bar, painter);
+    }
+};
+
+} // namespace
+
+TransfersView::TransfersView(Engine *engine, QWidget *parent)
+    : QWidget(parent), m_engine(engine) {
     auto *root = new QVBoxLayout(this);
-    root->setContentsMargins(16, 16, 16, 16);
-    root->addWidget(new QLabel(QStringLiteral("<b>下载任务</b>（分片断点续传；校验通过后才按原名交付 — UC-11/UC-12）"), this));
+    root->setContentsMargins(24, 20, 24, 20);
+    root->setSpacing(16);
 
-    m_table = new QTableWidget(0, 6, this);
-    m_table->setHorizontalHeaderLabels({QStringLiteral("文件"), QStringLiteral("进度"), QStringLiteral("速率"),
-                                        QStringLiteral("状态"), QStringLiteral("供给"), QStringLiteral("操作")});
+    m_countLabel = new DLabel(tr("Tasks: 0"), this);
+    m_countLabel->setForegroundRole(DPalette::TextTips);
+    root->addWidget(UiUtils::pageHeader(tr("Transfers"), m_countLabel, this));
+
+    m_stack = new QStackedWidget(this);
+
+    m_emptyPage = new QWidget(this);
+    auto *emptyLayout = new QVBoxLayout(m_emptyPage);
+    emptyLayout->setContentsMargins(24, 24, 24, 24);
+    emptyLayout->setSpacing(12);
+    emptyLayout->setAlignment(Qt::AlignCenter);
+    const QIcon emptyIcon = UiUtils::icon(QStringLiteral("folder-download"),
+                                          QStringLiteral("download"));
+    auto *icon = new QLabel(m_emptyPage);
+    icon->setAlignment(Qt::AlignCenter);
+    if (!emptyIcon.isNull())
+        icon->setPixmap(emptyIcon.pixmap(64, 64));
+    else
+        icon->hide();
+    auto *emptyTitle = new DLabel(tr("No download tasks"), m_emptyPage);
+    emptyTitle->setAlignment(Qt::AlignCenter);
+    emptyTitle->setForegroundRole(DPalette::TextTitle);
+    DFontSizeManager::instance()->bind(emptyTitle, DFontSizeManager::T4, QFont::DemiBold);
+    auto *emptyHint = new DLabel(
+        tr("Files announced in a room can be downloaded from the message stream."), m_emptyPage);
+    emptyHint->setAlignment(Qt::AlignCenter);
+    emptyHint->setWordWrap(true);
+    emptyHint->setForegroundRole(DPalette::TextTips);
+    emptyLayout->addStretch(1);
+    emptyLayout->addWidget(icon, 0, Qt::AlignHCenter);
+    emptyLayout->addWidget(emptyTitle);
+    emptyLayout->addWidget(emptyHint);
+    emptyLayout->addStretch(1);
+
+    m_table = new QTableView(this);
+    m_table->setObjectName(QStringLiteral("transfersView.table"));
+    UiUtils::setupTable(m_table);
+    m_model = new QStandardItemModel(0, 6, this);
+    m_table->setModel(m_model);
+    m_table->setItemDelegateForColumn(1, new ProgressColumnDelegate(m_table));
     m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    m_table->verticalHeader()->setVisible(false);
-    m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    root->addWidget(m_table, 1);
+    m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
+    m_table->horizontalHeader()->resizeSection(1, 170);
+    m_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
+    m_table->horizontalHeader()->resizeSection(2, 100);
+    m_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    m_table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    m_table->horizontalHeader()->setSectionResizeMode(5, QHeaderView::Fixed);
+    m_table->horizontalHeader()->resizeSection(5, 48);
+    connect(m_table, &QTableView::clicked, this, [this](const QModelIndex &index) {
+        if (index.column() == 5)
+            showTaskMenu(index);
+    });
+
+    m_stack->addWidget(m_table);
+    m_stack->addWidget(m_emptyPage);
+    root->addWidget(m_stack, 1);
 
     connect(m_engine->downloader(), &Downloader::taskChanged, this, &TransfersView::refresh);
-    connect(m_engine->downloader(), &Downloader::taskCompleted, this, [this](const QString &, const QString &) { refresh(); });
-    connect(m_engine->downloader(), &Downloader::taskFailed, this, [this](const QString &, const QString &) { refresh(); });
-    auto *t = new QTimer(this);
-    connect(t, &QTimer::timeout, this, &TransfersView::refresh);
-    t->start(1000); // UC-10 step 7: ~1s progress/speed refresh
+    connect(m_engine->downloader(), &Downloader::taskCompleted, this,
+            [this](const QString &, const QString &) { refresh(); });
+    connect(m_engine->downloader(), &Downloader::taskFailed, this,
+            [this](const QString &, const QString &) { refresh(); });
+    auto *timer = new QTimer(this);
+    connect(timer, &QTimer::timeout, this, &TransfersView::refresh);
+    timer->start(1000); // UC-10 step 7: ~1s progress/speed refresh
     refresh();
 }
 
 void TransfersView::refresh() {
-    const auto tasks = m_engine->downloader()->tasks();
-    m_table->setRowCount(tasks.size());
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    for (int i = 0; i < tasks.size(); ++i) {
-        const auto &tk = tasks[i];
-        m_table->setItem(i, 0, new QTableWidgetItem(tk.name));
-        const int pct = tk.totalChunks ? int(tk.doneChunks * 100 / tk.totalChunks) : 0;
-        auto *bar = new QProgressBar(m_table);
-        bar->setRange(0, 100);
-        bar->setValue(pct);
-        m_table->setCellWidget(i, 1, bar);
-
-        const qint64 bytes = qint64(tk.doneChunks) * qint64(tk.chunkSize);
-        QString speed;
-        if (m_lastMs.contains(tk.hash) && now > m_lastMs[tk.hash]) {
-            const double kb = (bytes - m_lastBytes[tk.hash]) * 10.0 / 1024.0; // ~1s window
-            if (kb >= 1024)
-                speed = QStringLiteral("%1 MB/s").arg(kb / 1024.0, 0, 'f', 1);
-            else
-                speed = QStringLiteral("%1 KB/s").arg(kb, 0, 'f', 0);
-        }
-        if (tk.status == TaskStatus::Downloading || tk.status == TaskStatus::Verifying) {
-            m_lastBytes[tk.hash] = bytes;
-            m_lastMs[tk.hash] = now;
-        }
-        m_table->setItem(i, 2, new QTableWidgetItem(speed));
-
-        const QString st = tk.status == TaskStatus::Queued        ? QStringLiteral("排队中")
-                           : tk.status == TaskStatus::Downloading ? QStringLiteral("下载中（多线程）")
-                           : tk.status == TaskStatus::Paused      ? QStringLiteral("已暂停")
-                           : tk.status == TaskStatus::Verifying   ? QStringLiteral("正在整体校验")
-                           : tk.status == TaskStatus::Done        ? QStringLiteral("已完成 ✓")
-                           : tk.status == TaskStatus::WaitingSupply ? QStringLiteral("等待供给")
-                           : QStringLiteral("失败");
-        auto *stItem = new QTableWidgetItem(tk.error.isEmpty() ? st : QStringLiteral("%1：%2").arg(st, tk.error));
-        if (tk.status == TaskStatus::Failed)
-            stItem->setForeground(QColor("#e53935"));
-        m_table->setItem(i, 3, stItem);
-
-        // UC-10 step 3/7: show where the bytes are coming from (or the delivered state).
-        const QString supply = !tk.currentSource.isEmpty()
-                                   ? QStringLiteral("来源：%1").arg(tk.currentSource)
-                                   : (tk.destPath.isEmpty() ? QString() : QStringLiteral("已交付"));
-        m_table->setItem(i, 4, new QTableWidgetItem(supply));
-
-        auto *ops = new QPushButton(QStringLiteral("⋮"), m_table);
-        ops->setFlat(true);
-        connect(ops, &QPushButton::clicked, this, [this, tk, ops] {
-            QMenu menu(ops);
-            if (tk.status == TaskStatus::Downloading || tk.status == TaskStatus::Queued)
-                menu.addAction(QStringLiteral("暂停"), [this, tk] { m_engine->downloader()->pause(tk.hash); });
-            if (tk.status == TaskStatus::Paused || tk.status == TaskStatus::WaitingSupply)
-                menu.addAction(QStringLiteral("继续（从已得分片续传）"), [this, tk] { m_engine->downloader()->resume(tk.hash, {}); });
-            if (tk.status == TaskStatus::Done || !tk.destPath.isEmpty())
-                menu.addAction(QStringLiteral("打开所在目录"), [tk] { QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(tk.destPath).absolutePath())); });
-            menu.addSeparator();
-            menu.addAction(QStringLiteral("取消并删除分片"), [this, tk] { m_engine->downloader()->cancel(tk.hash, true); });
-            menu.exec(ops->mapToGlobal(QPoint(0, ops->height())));
-        });
-        m_table->setCellWidget(i, 5, ops);
+    const QList<DownloadTaskView> tasks = m_engine->downloader()->tasks();
+    m_countLabel->setText(tr("Tasks: %1").arg(tasks.size()));
+    if (tasks.isEmpty()) {
+        m_stack->setCurrentWidget(m_emptyPage);
+        return;
     }
+    m_stack->setCurrentWidget(m_table);
+
+    const int scroll = m_table->verticalScrollBar()->value();
+    m_model->clear();
+    m_model->setHorizontalHeaderLabels(
+        {tr("File"), tr("Progress"), tr("Speed"), tr("Status"), tr("Source"), QString()});
+    m_model->setRowCount(tasks.size());
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    for (int row = 0; row < tasks.size(); ++row) {
+        const DownloadTaskView &task = tasks.at(row);
+
+        auto *file = new QStandardItem(task.name);
+        file->setData(task.hash, Qt::UserRole);
+        if (!task.destPath.isEmpty())
+            file->setToolTip(task.destPath);
+        m_model->setItem(row, 0, file);
+
+        const int percent = task.totalChunks ? int(task.doneChunks * 100 / task.totalChunks) : 0;
+        auto *progress = new QStandardItem;
+        progress->setData(percent, Qt::UserRole);
+        m_model->setItem(row, 1, progress);
+
+        const qint64 bytes = qint64(task.doneChunks) * qint64(task.chunkSize);
+        QString speed;
+        if (m_lastMs.contains(task.hash) && now > m_lastMs.value(task.hash)) {
+            const qint64 delta = bytes - m_lastBytes.value(task.hash);
+            const double seconds = qMax<qint64>(1, now - m_lastMs.value(task.hash)) / 1000.0;
+            const double kb = delta / 1024.0 / seconds;
+            if (kb >= 1024.0)
+                speed = tr("%1 MB/s").arg(kb / 1024.0, 0, 'f', 1);
+            else
+                speed = tr("%1 KB/s").arg(kb, 0, 'f', 0);
+        }
+        if (task.status == TaskStatus::Downloading || task.status == TaskStatus::Verifying) {
+            m_lastBytes[task.hash] = bytes;
+            m_lastMs[task.hash] = now;
+        }
+        m_model->setItem(row, 2, new QStandardItem(speed));
+
+        const QString state =
+            task.status == TaskStatus::Queued        ? tr("Queued")
+            : task.status == TaskStatus::Downloading ? tr("Downloading")
+            : task.status == TaskStatus::Paused      ? tr("Paused")
+            : task.status == TaskStatus::Verifying   ? tr("Verifying")
+            : task.status == TaskStatus::Done        ? tr("Done")
+            : task.status == TaskStatus::WaitingSupply ? tr("Waiting for supply")
+                                                       : tr("Failed");
+        auto *status = new QStandardItem(task.error.isEmpty()
+                                             ? state
+                                             : tr("%1: %2").arg(state, task.error));
+        if (task.status == TaskStatus::Failed) {
+            DPalette pal = DPaletteHelper::instance()->palette(m_table);
+            status->setForeground(pal.color(DPalette::TextWarning));
+        }
+        if (!task.error.isEmpty())
+            status->setToolTip(task.error);
+        m_model->setItem(row, 3, status);
+
+        const QString source = !task.currentSource.isEmpty()
+                                   ? tr("Source: %1").arg(task.currentSource)
+                                   : (task.destPath.isEmpty() ? QString() : tr("Delivered"));
+        m_model->setItem(row, 4, new QStandardItem(source));
+
+        auto *actions = new QStandardItem(UiUtils::icon(QStringLiteral("view-more")), QString());
+        actions->setToolTip(tr("Actions"));
+        m_model->setItem(row, 5, actions);
+    }
+    m_table->verticalScrollBar()->setValue(scroll);
+}
+
+void TransfersView::showTaskMenu(const QModelIndex &index) {
+    if (!index.isValid())
+        return;
+    QStandardItem *file = m_model->item(index.row(), 0);
+    if (!file)
+        return;
+    const QString hash = file->data(Qt::UserRole).toString();
+    const DownloadTaskView task = m_engine->downloader()->task(hash);
+
+    QMenu menu(this);
+    if (task.status == TaskStatus::Downloading || task.status == TaskStatus::Queued)
+        menu.addAction(tr("Pause"), [this, hash] { m_engine->downloader()->pause(hash); });
+    if (task.status == TaskStatus::Paused || task.status == TaskStatus::WaitingSupply)
+        menu.addAction(tr("Resume from downloaded chunks"),
+                       [this, hash] { m_engine->downloader()->resume(hash, {}); });
+    if (task.status == TaskStatus::Done || !task.destPath.isEmpty())
+        menu.addAction(tr("Open containing folder"), [task] {
+            QDesktopServices::openUrl(
+                QUrl::fromLocalFile(QFileInfo(task.destPath).absolutePath()));
+        });
+    menu.addSeparator();
+    menu.addAction(tr("Cancel and delete chunks"),
+                   [this, hash] { m_engine->downloader()->cancel(hash, true); });
+    menu.exec(QCursor::pos());
 }
 
 } // namespace meshlink
