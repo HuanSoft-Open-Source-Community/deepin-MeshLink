@@ -33,3 +33,6 @@ compile_commands.json
 
 # --- local-only docs / scratch (requirement spec lives here) ---
 .tmp/
+
+# --- agent teams local state ---
+.agent-teams/
