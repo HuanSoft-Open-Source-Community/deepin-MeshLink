@@ -7,8 +7,10 @@
 
 #include <QCryptographicHash>
 #include <QDataStream>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QHostInfo>
 #include <QImage>
 #include <QPainter>
@@ -17,10 +19,389 @@
 #include <QSqlQuery>
 #include <QVariant>
 
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace meshlink {
 namespace {
+
+constexpr size_t kKeystoreDeviceKeyBytes = 32;
+constexpr size_t kKeystoreSaltBytes = 16;
+
+enum class SecretIo { Ok, Missing, Invalid, Error };
+
+// Read a small secret file without creating or changing it. `Invalid` means
+// the file exists but is unreadable or has an unexpected size: callers must not
+// replace it, otherwise existing encrypted blobs would lose their KEK.
+SecretIo readSecretFile(const QByteArray &nativePath, size_t expected, Bytes &out) {
+    int fd = ::open(nativePath.constData(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? SecretIo::Missing : SecretIo::Error;
+    uint8_t buf[64];
+    size_t total = 0;
+    bool tooLong = false;
+    for (;;) {
+        const ssize_t n = ::read(fd, buf + total, sizeof(buf) - total);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            ::close(fd);
+            return SecretIo::Error;
+        }
+        if (n == 0)
+            break;
+        total += size_t(n);
+        if (total > expected) {
+            tooLong = true;
+            break;
+        }
+    }
+    ::close(fd);
+    if (tooLong || total != expected)
+        return SecretIo::Invalid;
+    out.assign(buf, buf + total);
+    return SecretIo::Ok;
+}
+
+bool ensureKeystoreDir() {
+    const QString dir = QFileInfo(Paths::keystoreDeviceKey()).absolutePath();
+    if (!QDir().mkpath(dir))
+        return false;
+    // Secrets inside are 0600; keep the containing directory owner-only too.
+    ::chmod(QFile::encodeName(dir).constData(), S_IRWXU);
+    return true;
+}
+
+// Create a secret exactly once. O_EXCL makes sure an existing key is never
+// overwritten, even when two processes start concurrently; if another process
+// wins the race we read its value instead of replacing it. `created` reports
+// whether this call actually wrote the file (false when an existing one was
+// adopted after the race).
+Bytes createSecretFileExclusive(const QByteArray &nativePath, size_t size, bool *created = nullptr) {
+    if (created)
+        *created = false;
+    Bytes value = Crypto::randomBytes(size);
+    int fd = ::open(nativePath.constData(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            Bytes existing;
+            return readSecretFile(nativePath, size, existing) == SecretIo::Ok ? existing : Bytes{};
+        }
+        return {};
+    }
+    size_t written = 0;
+    while (written < value.size()) {
+        const ssize_t n = ::write(fd, value.data() + written, value.size() - written);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (n == 0)
+            break;
+        written += size_t(n);
+    }
+    ::fchmod(fd, S_IRUSR | S_IWUSR); // 0600, independent of the process umask
+    if (written == value.size())
+        ::fsync(fd);
+    ::close(fd);
+    if (written != value.size()) {
+        ::unlink(nativePath.constData());
+        return {};
+    }
+    if (created)
+        *created = true;
+    return value;
+}
+
+QString keystoreDirPath() { return QFileInfo(Paths::keystoreDeviceKey()).absolutePath(); }
+
+QString deviceKeyTagPath() { return Paths::keystoreDeviceKey() + QStringLiteral(".tag"); }
+
+// Retained copy of the last legacy-format ciphertext of an account. It is only
+// a fallback recovery path: the live row is still the source of truth.
+QString legacyKeystoreDirPath() { return keystoreDirPath() + QStringLiteral("/legacy"); }
+
+QString legacyKeystorePath(qint64 id) {
+    return legacyKeystoreDirPath() + QStringLiteral("/%1.blob").arg(id);
+}
+
+constexpr char kDeviceKeyTagContext[] = "meshlink.keystore.device-key.v1";
+
+Bytes deviceKeyTagFor(const Bytes &key) {
+    const QByteArray context(kDeviceKeyTagContext);
+    return Crypto::hmacSha256(key, Bytes(context.begin(), context.end()));
+}
+
+bool fileExists(const QByteArray &native) { return ::access(native.constData(), F_OK) == 0; }
+
+bool ensureOwnerOnlyDir(const QString &path) {
+    if (!QDir().mkpath(path))
+        return false;
+    ::chmod(QFile::encodeName(path).constData(), S_IRWXU);
+    return true;
+}
+
+// Write a secret atomically (temp file + rename) with 0600 permissions and
+// fsync both the file and its parent directory. `exclusive` writes the final
+// path with O_EXCL and never replaces an existing file (used for the tag, which
+// must stay immutable once it exists); the default overwrites atomically (used
+// for the retained legacy ciphertext).
+bool writeSecretFileAtomic(const QString &path, const Bytes &data, QString *error,
+                           bool exclusive = false) {
+    if (data.empty()) {
+        if (error)
+            *error = QStringLiteral("empty secret");
+        return false;
+    }
+    const QByteArray native = QFile::encodeName(path);
+    const QByteArray tmp = exclusive
+                               ? native
+                               : native + QByteArrayLiteral(".tmp.")
+                                             + QByteArray::number(static_cast<qlonglong>(::getpid()));
+    if (!exclusive)
+        ::unlink(tmp.constData());
+    int fd = ::open(tmp.constData(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        if (error)
+            *error = errno == EEXIST ? QStringLiteral("secret already exists")
+                                     : QStringLiteral("cannot create secret file");
+        return false;
+    }
+    size_t written = 0;
+    while (written < data.size()) {
+        const ssize_t n = ::write(fd, data.data() + written, data.size() - written);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (n == 0)
+            break;
+        written += size_t(n);
+    }
+    ::fchmod(fd, S_IRUSR | S_IWUSR);
+    if (written == data.size())
+        ::fsync(fd);
+    ::close(fd);
+    if (written != data.size()) {
+        ::unlink(tmp.constData());
+        if (error)
+            *error = QStringLiteral("cannot write secret file");
+        return false;
+    }
+    if (!exclusive && ::rename(tmp.constData(), native.constData()) != 0) {
+        ::unlink(tmp.constData());
+        if (error)
+            *error = QStringLiteral("cannot replace secret file");
+        return false;
+    }
+    ::chmod(native.constData(), S_IRUSR | S_IWUSR);
+    const QByteArray parent = QFile::encodeName(QFileInfo(path).absolutePath());
+    int dfd = ::open(parent.constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd >= 0) {
+        ::fsync(dfd);
+        ::close(dfd);
+    }
+    return true;
+}
+
+bool writeDeviceKeyTag(const Bytes &key) {
+    if (key.size() != kKeystoreDeviceKeyBytes)
+        return false;
+    return writeSecretFileAtomic(deviceKeyTagPath(), deviceKeyTagFor(key), nullptr, true);
+}
+
+// Per-install random device secret: the stable factor of the current KEK.
+// Created once (O_EXCL) and never overwritten. A missing key with a surviving
+// tag is an ambiguous partial restore: no replacement key is generated and the
+// tag is left untouched, so the original key can still be restored. Existing
+// keys never gain provenance from the co-located tag alone; loadAccount()
+// requires proof tied to this account database (a device-key-encrypted row) or
+// the fresh first-upgrade case where both key and tag were absent.
+struct DeviceSecretState {
+    Bytes key;
+    bool createdThisProcess = false;
+    bool provenanceVerified = false;
+};
+
+DeviceSecretState loadOrCreateDeviceKeyState() {
+    DeviceSecretState state;
+    if (!ensureKeystoreDir())
+        return state;
+    const QByteArray native = QFile::encodeName(Paths::keystoreDeviceKey());
+    switch (readSecretFile(native, kKeystoreDeviceKeyBytes, state.key)) {
+    case SecretIo::Ok:
+        ::chmod(native.constData(), S_IRUSR | S_IWUSR); // tighten old permissions
+        return state;
+    case SecretIo::Missing: {
+        // A stale tag proves a previous key existed. Do not overwrite it and do
+        // not bless a replacement: keep the legacy keystore read-only until the
+        // intended key is restored.
+        if (fileExists(QFile::encodeName(deviceKeyTagPath()))) {
+            qWarning("meshlink: keystore device secret is missing but its tag remains; "
+                     "refusing to create a replacement key and leaving the tag untouched");
+            return state;
+        }
+        bool created = false;
+        state.key = createSecretFileExclusive(native, kKeystoreDeviceKeyBytes, &created);
+        state.createdThisProcess = created;
+        if (state.key.size() == kKeystoreDeviceKeyBytes && created) {
+            // Fresh first upgrade: both key and tag were absent, so this key is
+            // the intended device key for the database being created.
+            state.provenanceVerified = writeDeviceKeyTag(state.key);
+            if (!state.provenanceVerified)
+                qWarning("meshlink: created the keystore device secret but could not persist its tag; "
+                         "legacy keystore migration stays disabled");
+        }
+        return state;
+    }
+    case SecretIo::Invalid:
+        qWarning("meshlink: keystore device secret %s has an unexpected size; refusing to replace it",
+                 qUtf8Printable(Paths::keystoreDeviceKey()));
+        return state;
+    case SecretIo::Error:
+        qWarning("meshlink: cannot read the keystore device secret %s",
+                 qUtf8Printable(Paths::keystoreDeviceKey()));
+        return state;
+    }
+    return state;
+}
+
+Bytes loadOrCreateDeviceKey() { return loadOrCreateDeviceKeyState().key; }
+
+bool retainLegacyKeystoreBlob(qint64 id, const QByteArray &blob, QString *error) {
+    if (blob.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("empty legacy blob");
+        return false;
+    }
+    if (!ensureOwnerOnlyDir(legacyKeystoreDirPath())) {
+        if (error)
+            *error = QStringLiteral("cannot create legacy keystore directory");
+        return false;
+    }
+    const Bytes cipher(reinterpret_cast<const uint8_t *>(blob.constData()),
+                       reinterpret_cast<const uint8_t *>(blob.constData()) + blob.size());
+    return writeSecretFileAtomic(legacyKeystorePath(id), cipher, error);
+}
+
+Bytes loadOrCreateSalt() {
+    if (!ensureKeystoreDir())
+        return {};
+    const QByteArray native = QFile::encodeName(Paths::keystoreSalt());
+    Bytes salt;
+    switch (readSecretFile(native, kKeystoreSaltBytes, salt)) {
+    case SecretIo::Ok:
+        ::chmod(native.constData(), S_IRUSR | S_IWUSR);
+        return salt;
+    case SecretIo::Missing:
+        return createSecretFileExclusive(native, kKeystoreSaltBytes);
+    default:
+        qWarning("meshlink: keystore salt %s is unreadable; refusing to replace it",
+                 qUtf8Printable(Paths::keystoreSalt()));
+        return {};
+    }
+}
+
+QByteArray readMachineIdFile(const char *path) {
+    QFile f(QString::fromLatin1(path));
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+    return f.readAll().trimmed();
+}
+
+// Legacy machine-bound factors exactly as the pre-device-key build derived
+// them: machine-id, the dbus machine-id copy, or the hostname, each followed
+// by the login uid. Kept only to migrate old blobs; never used to encrypt.
+// MESHLINK_LEGACY_MACHINE_FACTOR is a test-only override that simulates a
+// machine-id/hostname change deterministically; it is ignored in normal runs
+// and never participates in the new device-key derivation.
+QVector<Bytes> legacyMachineFactors() {
+    QVector<QByteArray> identities;
+    const QByteArray override = qgetenv("MESHLINK_LEGACY_MACHINE_FACTOR");
+    if (!override.isEmpty()) {
+        identities << override;
+    } else {
+        for (const char *path : {"/etc/machine-id", "/var/lib/dbus/machine-id"}) {
+            const QByteArray id = readMachineIdFile(path);
+            if (!id.isEmpty() && !identities.contains(id))
+                identities << id;
+        }
+        const QByteArray host = QHostInfo::localHostName().toUtf8();
+        if (!host.isEmpty() && !identities.contains(host))
+            identities << host;
+    }
+    const QByteArray uid = QByteArray::number(static_cast<qint64>(::getuid()));
+    QVector<Bytes> factors;
+    for (const QByteArray &identity : identities) {
+        const QByteArray raw = identity + uid;
+        factors.append(Bytes(raw.begin(), raw.end()));
+    }
+    return factors;
+}
+
+// Checked account count used after a destroy. Both exec() and next() must
+// succeed; a failed query must never be mistaken for "no accounts left"
+// (which would delete the install-wide keystore secrets). The environment
+// override is test-only fault injection for the failure path.
+bool countAccountsChecked(Storage *storage, int *count, QString *why) {
+    if (qEnvironmentVariableIsSet("MESHLINK_TEST_FAIL_ACCOUNT_COUNT")) {
+        if (why)
+            *why = QStringLiteral("injected COUNT(*) failure");
+        return false;
+    }
+    QSqlQuery q = storage->query("SELECT COUNT(*) FROM account");
+    if (!q.exec()) {
+        if (why)
+            *why = q.lastError().text();
+        return false;
+    }
+    if (!q.next()) {
+        if (why)
+            *why = QStringLiteral("COUNT(*) returned no row");
+        return false;
+    }
+    *count = q.value(0).toInt();
+    return true;
+}
+
+// Independent provenance for an existing device key: at least one *other*
+// account row in this database is already encrypted with it. AES-GCM
+// authentication makes a successful decrypt proof that this database was
+// written with the key; the co-located tag alone cannot provide that.
+bool databaseHasDeviceKeyProof(Storage *storage, qint64 skipId, const Bytes &kek) {
+    if (kek.size() != kKeystoreDeviceKeyBytes)
+        return false;
+    QSqlQuery q = storage->query("SELECT id,keystore_blob FROM account WHERE id<>?");
+    q.bindValue(0, skipId);
+    if (!q.exec()) {
+        qWarning("meshlink: could not inspect account blobs for device-key provenance: %s",
+                 qUtf8Printable(q.lastError().text()));
+        return false;
+    }
+    while (q.next()) {
+        const QByteArray blob = q.value(1).toByteArray();
+        if (blob.size() <= 16 + 12 + 16) // shorter than salt||iv||tag
+            continue;
+        const Bytes cipher(reinterpret_cast<const uint8_t *>(blob.constData()),
+                           reinterpret_cast<const uint8_t *>(blob.constData()) + blob.size());
+        if (Crypto::aesGcmDecrypt(cipher, kek))
+            return true;
+    }
+    return false;
+}
+
+QByteArray readRetainedLegacyBlob(qint64 id) {
+    QFile f(legacyKeystorePath(id));
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+    if (f.size() > 4 * 1024 * 1024) // account blobs are tiny; refuse junk
+        return {};
+    return f.readAll();
+}
 
 // Pack plaintext private material; AES-GCM-encrypted into account.keystore_blob.
 Bytes packPrivate(const Identity &id, const TlsMaterial &tls) {
@@ -54,40 +435,6 @@ bool unpackPrivate(const Bytes &plain, Identity &id, std::string &tlsKeyPem) {
     return true;
 }
 
-Bytes machineFactor() {
-    QByteArray mid;
-    QFile f("/etc/machine-id");
-    if (f.open(QIODevice::ReadOnly))
-        mid = f.readAll().trimmed();
-    if (mid.isEmpty()) {
-        QFile f2("/var/lib/dbus/machine-id");
-        if (f2.open(QIODevice::ReadOnly))
-            mid = f2.readAll().trimmed();
-    }
-    if (mid.isEmpty())
-        mid = QHostInfo::localHostName().toUtf8();
-    mid += QByteArray::number(static_cast<qint64>(::getuid()));
-    return Bytes(mid.begin(), mid.end());
-}
-
-Bytes loadOrCreateSalt() {
-    QFile f(Paths::keystoreSalt());
-    if (f.open(QIODevice::ReadOnly)) {
-        Bytes b;
-        const QByteArray raw = f.readAll();
-        b.assign(raw.begin(), raw.end());
-        if (b.size() == 16)
-            return b;
-    }
-    Bytes salt = Crypto::randomBytes(16);
-    if (f.open(QIODevice::WriteOnly)) {
-        f.write(reinterpret_cast<const char *>(salt.data()), int(salt.size()));
-        f.flush();
-        QFile::setPermissions(Paths::keystoreSalt(), QFile::ReadOwner | QFile::WriteOwner);
-    }
-    return salt;
-}
-
 } // namespace
 
 AccountManager::AccountManager(Storage *storage, QObject *parent) : QObject(parent), m_storage(storage) {}
@@ -116,7 +463,30 @@ bool AccountManager::validateNickname(const QString &nick, QString *why) {
     return true;
 }
 
-Bytes AccountManager::kek() const { return Crypto::deriveKek(machineFactor(), loadOrCreateSalt()); }
+Bytes AccountManager::kek() const {
+    // Stable per-install factor + install salt. No machine-id, hostname, MAC or
+    // IP is involved: moving the data directory to the same machine or changing
+    // network identity cannot invalidate the keystore.
+    const Bytes salt = loadOrCreateSalt();
+    if (salt.size() != kKeystoreSaltBytes)
+        return {};
+    const Bytes deviceSecret = loadOrCreateDeviceKey();
+    if (deviceSecret.size() != kKeystoreDeviceKeyBytes)
+        return {};
+    return Crypto::deriveKek(deviceSecret, salt);
+}
+
+bool AccountManager::rewriteKeystoreBlob(qint64 id, const Bytes &blob, QString *error) {
+    QSqlQuery q = m_storage->query("UPDATE account SET keystore_blob=? WHERE id=?");
+    q.bindValue(0, QByteArray(reinterpret_cast<const char *>(blob.data()), int(blob.size())));
+    q.bindValue(1, id);
+    if (!q.exec()) {
+        if (error)
+            *error = q.lastError().text();
+        return false;
+    }
+    return true;
+}
 
 QPixmap AccountManager::makeIdenticon(const QString &seed, int size) {
     QImage img(size, size, QImage::Format_ARGB32_Premultiplied);
@@ -172,6 +542,16 @@ QVector<AccountEntry> AccountManager::listAccounts() const {
 qint64 AccountManager::createNewAccount(const QString &desiredNickname, QString *error) {
     Paths::ensureDirs();
 
+    // New blobs may only ever be encrypted with the device-secret KEK. If the
+    // local keystore cannot be prepared, fail instead of falling back to a
+    // machine-bound key.
+    const Bytes newKek = kek();
+    if (newKek.size() != 32) {
+        if (error)
+            *error = tr("Private key encryption failed");
+        return -1;
+    }
+
     auto id = Crypto::generateIdentity();
     if (!id) {
         if (error)
@@ -186,7 +566,7 @@ qint64 AccountManager::createNewAccount(const QString &desiredNickname, QString 
     }
 
     Bytes priv = packPrivate(*id, *tls);
-    Bytes blob = Crypto::aesGcmEncrypt(priv, kek());
+    Bytes blob = Crypto::aesGcmEncrypt(priv, newKek);
     if (blob.empty()) {
         if (error)
             *error = tr("Private key encryption failed");
@@ -276,8 +656,62 @@ bool AccountManager::loadAccount(qint64 id, QString *error) {
 
     Bytes key(reinterpret_cast<const uint8_t *>(blob.constData()),
               reinterpret_cast<const uint8_t *>(blob.constData()) + blob.size());
-    auto plain = Crypto::aesGcmDecrypt(key, kek());
+    const Bytes salt = loadOrCreateSalt();
+    const DeviceSecretState device = loadOrCreateDeviceKeyState();
+    Bytes newKek;
+    if (salt.size() == kKeystoreSaltBytes && device.key.size() == kKeystoreDeviceKeyBytes)
+        newKek = Crypto::deriveKek(device.key, salt);
+
+    std::optional<Bytes> plain;
+    // The only non-database provenance is a genuinely fresh first upgrade
+    // (both device.key and its tag were absent). For every existing key,
+    // provenance comes from decrypting a device-key blob tied to this database.
+    bool deviceKeyProven = device.provenanceVerified;
+    if (!newKek.empty()) {
+        plain = Crypto::aesGcmDecrypt(key, newKek);
+        if (plain)
+            deviceKeyProven = true; // this row itself is device-key bound
+    }
+
+    // Migration fallback 1: keystores written before the per-install device
+    // secret used machine-id/hostname + uid as the KDF factor. Try every legacy
+    // factor this machine can still produce.
+    bool legacyFromRow = false;
+    bool legacyFromCopy = false;
+    if (!plain && salt.size() == kKeystoreSaltBytes) {
+        for (const Bytes &factor : legacyMachineFactors()) {
+            auto candidate = Crypto::aesGcmDecrypt(key, Crypto::deriveKek(factor, salt));
+            if (candidate) {
+                plain = candidate;
+                legacyFromRow = true;
+                break;
+            }
+        }
+    }
+
+    // Migration fallback 2: the retained ciphertext of the last legacy blob.
+    // This keeps the account readable if the live row was already migrated but
+    // its device key was later lost, rotated or replaced by a wrong one.
+    if (!plain && salt.size() == kKeystoreSaltBytes) {
+        const QByteArray retained = readRetainedLegacyBlob(id);
+        if (!retained.isEmpty() && retained != blob) {
+            const Bytes retainedCipher(reinterpret_cast<const uint8_t *>(retained.constData()),
+                                       reinterpret_cast<const uint8_t *>(retained.constData())
+                                           + retained.size());
+            for (const Bytes &factor : legacyMachineFactors()) {
+                auto candidate = Crypto::aesGcmDecrypt(retainedCipher,
+                                                       Crypto::deriveKek(factor, salt));
+                if (candidate) {
+                    plain = candidate;
+                    legacyFromCopy = true;
+                    break;
+                }
+            }
+        }
+    }
+
     if (!plain) {
+        // Keep the historical, non-destructive error: no crash, no wipe.
         if (error)
             *error = tr("Private key decryption failed (device or credentials changed)");
         return false;
@@ -290,6 +724,46 @@ bool AccountManager::loadAccount(qint64 id, QString *error) {
         if (error)
             *error = tr("Key material is corrupted");
         return false;
+    }
+    if (legacyFromRow && !deviceKeyProven && !newKek.empty()) {
+        // The current row is legacy; require another device-key-encrypted row
+        // in this exact database before rewriting the only legacy ciphertext.
+        deviceKeyProven = databaseHasDeviceKeyProof(m_storage, id, newKek);
+    }
+    if (legacyFromRow) {
+        if (newKek.empty()) {
+            qWarning("meshlink: legacy keystore of account %lld could not be migrated: "
+                     "the per-install device secret is unavailable",
+                     static_cast<long long>(id));
+        } else if (!deviceKeyProven) {
+            qWarning("meshlink: legacy keystore of account %lld was left unchanged: the current "
+                     "device secret is not proven by any device-key-encrypted account in this database",
+                     static_cast<long long>(id));
+        } else {
+            // Keep a recoverable copy of the only legacy ciphertext before
+            // replacing the row. If retaining fails, do not rewrite anything.
+            QString retainError;
+            if (!retainLegacyKeystoreBlob(id, blob, &retainError)) {
+                qWarning("meshlink: legacy keystore of account %lld was left unchanged because its "
+                         "recovery copy could not be retained: %s",
+                         static_cast<long long>(id), qUtf8Printable(retainError));
+            } else {
+                Bytes reencrypted = Crypto::aesGcmEncrypt(*plain, newKek);
+                QString migrationError;
+                if (reencrypted.empty() || !rewriteKeystoreBlob(id, reencrypted, &migrationError)) {
+                    qWarning("meshlink: could not migrate the legacy keystore of account %lld: %s",
+                             static_cast<long long>(id),
+                             reencrypted.empty() ? "encryption failed"
+                                                 : qUtf8Printable(migrationError));
+                }
+            }
+        }
+    } else if (legacyFromCopy) {
+        // The stored row stays untouched: it may be valid for the intended key
+        // and must not be replaced by a copy made with the current one.
+        qWarning("meshlink: account %lld was loaded from its retained legacy keystore copy; "
+                 "the stored row was left unchanged",
+                 static_cast<long long>(id));
     }
     m_edPriv = ident.ed25519Priv;
     m_tlsKeyPem = QString::fromStdString(tlsKey);
@@ -430,65 +904,97 @@ void AccountManager::ensureAvatarLocation(qint64 id) {
 }
 
 int AccountManager::destroyAccount(bool wipeHistoryAndFiles, QString *error) {
+    if (m_activeId <= 0 || m_profile.fingerprint.isEmpty()) {
+        if (error)
+            *error = tr("No local account");
+        return -1;
+    }
+    return destroyAccountInternal(m_activeId, m_profile.fingerprint, m_profile.avatarPath, true,
+                                  wipeHistoryAndFiles, error);
+}
+
+int AccountManager::destroyAccountById(qint64 id, bool wipeHistoryAndFiles, QString *error) {
+    if (id <= 0) {
+        if (error)
+            *error = tr("No local account with id %1").arg(id);
+        return -1;
+    }
+    QSqlQuery lookup = m_storage->query("SELECT fingerprint FROM account WHERE id=?");
+    lookup.bindValue(0, id);
+    if (!lookup.exec() || !lookup.next()) {
+        if (error)
+            *error = tr("No local account with id %1").arg(id);
+        return -1;
+    }
+    const QString fingerprint = lookup.value(0).toString();
+
+    QString avatarPath;
+    QSqlQuery pq = m_storage->query("SELECT avatar_path FROM profile WHERE account_id=?");
+    pq.bindValue(0, id);
+    if (pq.exec() && pq.next())
+        avatarPath = pq.value(0).toString();
+
+    return destroyAccountInternal(id, fingerprint, avatarPath, id == m_activeId,
+                                  wipeHistoryAndFiles, error);
+}
+
+int AccountManager::destroyAccountInternal(qint64 id, const QString &fingerprint,
+                                           const QString &avatarPath, bool active,
+                                           bool wipeHistoryAndFiles, QString *error) {
     // Step 5: securely overwrite the keystore material.
     // Private key lives only inside account.keystore_blob, so we zero that row.
-    const QString fingerprint = m_profile.fingerprint;
     QSqlQuery q = m_storage->query("UPDATE account SET keystore_blob=? WHERE id=?");
     q.bindValue(0, QByteArray(64, '\0'));
-    q.bindValue(1, m_activeId);
+    q.bindValue(1, id);
     q.exec();
-    // wipe the on-disk salt so the (already randomised) blob is unrecoverable
-    QFile::remove(Paths::keystoreSalt());
 
     // Step 6/5: remove identity + (optionally) session data.
     if (!m_storage->wipeAccount(fingerprint, wipeHistoryAndFiles, error))
         return -1;
 
-    // remove the avatar cache of the destroyed account
-    if (!m_profile.avatarPath.isEmpty())
-        QFile::remove(m_profile.avatarPath);
-
-    m_profile = Profile{};
-    m_activeId = 0;
-    m_edPriv.clear();
-    m_tlsKeyPem.clear();
-    return listAccounts().size();
-}
-
-bool AccountManager::deleteAccount(qint64 id, bool wipeHistoryAndFiles, QString *error) {
-    QSqlQuery q = m_storage->query("SELECT fingerprint FROM account WHERE id=?");
-    q.bindValue(0, id);
-    q.exec();
-    if (!q.next()) {
-        if (error)
-            *error = tr("No local account");
-        return false;
-    }
-    const QString fingerprint = q.value(0).toString();
-
-    QSqlQuery zero = m_storage->query("UPDATE account SET keystore_blob=? WHERE id=?");
-    zero.bindValue(0, QByteArray(64, '\0'));
-    zero.bindValue(1, id);
-    zero.exec();
-
-    QString avatarPath;
-    QSqlQuery pq = m_storage->query("SELECT avatar_path FROM profile WHERE account_id=?");
-    pq.bindValue(0, id);
-    pq.exec();
-    if (pq.next())
-        avatarPath = pq.value(0).toString();
-
-    if (!m_storage->wipeAccount(fingerprint, wipeHistoryAndFiles, error))
-        return false;
+    // remove the avatar cache and the retained legacy ciphertext of the
+    // destroyed account (the latter is only a recovery fallback)
     if (!avatarPath.isEmpty())
         QFile::remove(avatarPath);
-    if (m_activeId == id) {
+    QFile::remove(legacyKeystorePath(id));
+
+    if (active) {
         m_profile = Profile{};
         m_activeId = 0;
         m_edPriv.clear();
         m_tlsKeyPem.clear();
     }
-    return true;
+
+    // The install-wide salt and device secret are shared by every local
+    // account: remove them only once the last account is gone. Deleting them
+    // earlier would make the remaining accounts undecryptable. Both exec() and
+    // next() must succeed; a failed count is an error, never "zero left".
+    int remaining = 0;
+    QString countError;
+    if (!countAccountsChecked(m_storage, &remaining, &countError)) {
+        qWarning("meshlink: could not verify the remaining accounts after destroying %s: %s; "
+                 "keeping the install-wide keystore secrets",
+                 qUtf8Printable(fingerprint.left(8)), qUtf8Printable(countError));
+        if (error)
+            *error = tr("The account was removed, but the remaining accounts could not be verified; "
+                        "the local keystore was preserved");
+        return -1;
+    }
+    if (remaining == 0) {
+        QFile::remove(Paths::keystoreSalt());
+        QFile::remove(Paths::keystoreDeviceKey());
+        QFile::remove(deviceKeyTagPath());
+        if (!QDir(legacyKeystoreDirPath()).removeRecursively()
+            && QDir(legacyKeystoreDirPath()).exists()) {
+            qWarning("meshlink: could not remove the retained legacy keystore directory %s",
+                     qUtf8Printable(legacyKeystoreDirPath()));
+        }
+    }
+    return remaining;
+}
+
+bool AccountManager::deleteAccount(qint64 id, bool wipeHistoryAndFiles, QString *error) {
+    return destroyAccountById(id, wipeHistoryAndFiles, error) >= 0;
 }
 
 bool AccountManager::sign(const QByteArray &msg, QByteArray *sigOut) const {

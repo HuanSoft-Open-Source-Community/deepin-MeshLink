@@ -322,9 +322,9 @@ std::string Crypto::randomHex(size_t bytes) {
     return s;
 }
 
-Bytes Crypto::deriveKek(const Bytes &machineFactor, const Bytes &salt) {
-    // HKDF-like: KEK = SHA256(SHA256(machineFactor || salt) || salt)
-    Bytes joined = machineFactor;
+Bytes Crypto::deriveKek(const Bytes &factor, const Bytes &salt) {
+    // HKDF-like: KEK = SHA256(SHA256(factor || salt) || salt)
+    Bytes joined = factor;
     joined.insert(joined.end(), salt.begin(), salt.end());
     Bytes h1 = sha256(joined);
     Bytes h1s = h1;

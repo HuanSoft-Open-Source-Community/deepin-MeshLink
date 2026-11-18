@@ -93,6 +93,7 @@ void FirstStartWizard::createAccount() {
         m_error->show();
         return;
     }
+    m_accepted = true;
     accept();
 }
 
@@ -146,7 +147,8 @@ bool FirstStartWizard::ensureAccount(Engine *engine, QWidget *parent) {
     if (engine->hasLocalAccount())
         return true;
     FirstStartWizard wizard(engine, parent);
-    return wizard.exec() == QDialog::Accepted;
+    wizard.exec();
+    return wizard.m_accepted;
 }
 
 bool FirstStartWizard::runAsRecovery(Engine *engine, QWidget *parent) {
@@ -155,7 +157,8 @@ bool FirstStartWizard::runAsRecovery(Engine *engine, QWidget *parent) {
         tr("The local account could not be decrypted (device or credentials changed).\n"
            "Creating a new account will erase the old account's local data; this cannot be "
            "undone."));
-    if (wizard.exec() != QDialog::Accepted)
+    wizard.exec();
+    if (!wizard.m_accepted)
         return false;
     QString error;
     if (!engine->start(&error)) { // retry bringing up networking with the fresh identity
@@ -174,7 +177,8 @@ bool FirstStartWizard::createAdditionalAccount(Engine *engine, QWidget *parent) 
                          "generated. Existing accounts stay available and can be switched to "
                          "any time."));
     wizard.setButtonText(1, tr("Cancel")); // "Quit" reads wrong when adding
-    if (wizard.exec() != QDialog::Accepted)
+    wizard.exec();
+    if (!wizard.m_accepted)
         return false;
     return engine->account()->profile().valid;
 }

@@ -19,7 +19,12 @@ QString dataRoot();      // ~/.local/share/deepin-meshlink
 QString configRoot();    // ~/.config/deepin-meshlink
 QString databaseFile();  // <data>/meshlink.db
 QString keystoreFile();  // <data>/keystore/identity.bin
-QString keystoreSalt();  // <data>/keystore/salt
+QString keystoreSalt();  // <data>/keystore/salt (16 random bytes, 0600)
+// Per-install random secret used as the key-encryption-key factor for the
+// account keystore (32 bytes, 0600). Created once with O_EXCL semantics and
+// never overwritten; unlike machine-id/hostname/MAC/IP it survives device and
+// network identity changes.
+QString keystoreDeviceKey(); // <data>/keystore/device.key
 QString avatarDir();     // <data>/avatars
 QString blobDir();       // <data>/blobs   (avatars + images shared by hash)
 QString downloadDir();   // <data>/downloads  (task working dirs)

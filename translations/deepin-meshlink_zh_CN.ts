@@ -4,7 +4,7 @@
 <context>
     <name>ChatView</name>
     <message>
-        <location filename="../src/ui/chatview.cpp" line="+87"/>
+        <location filename="../src/ui/chatview.cpp" line="+116"/>
         <source>Pending</source>
         <translation>发送中</translation>
     </message>
@@ -49,20 +49,74 @@
         <source>deepin-MeshLink</source>
         <translation>深度织讯</translation>
     </message>
+</context>
+<context>
+    <name>MemberMenu</name>
     <message>
-        <location line="+104"/>
-        <source>Account destroyed</source>
-        <translation>账户已销毁</translation>
-    </message>
-    <message>
-        <location line="+1"/>
-        <source>The local account, keys and history were erased. Restart deepin-MeshLink to create a new account.</source>
-        <translation>本地账户与密钥已安全擦除。请重新启动深度织讯以创建新账户。</translation>
+        <location filename="../src/ui/membermenu.cpp" line="+62"/>
+        <source>The host rejected the action.</source>
+        <translation>托管者拒绝了该操作。</translation>
     </message>
     <message>
         <location line="+5"/>
-        <source>Quit</source>
-        <translation>退出</translation>
+        <source>Action rejected</source>
+        <translation>操作被拒绝</translation>
+    </message>
+    <message>
+        <location line="+10"/>
+        <source>Mention (@%1)</source>
+        <translation>提及（@%1）</translation>
+    </message>
+    <message>
+        <location line="+14"/>
+        <source>Revoke admin</source>
+        <translation>撤销管理员</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Set as admin</source>
+        <translation>设为管理员</translation>
+    </message>
+    <message>
+        <location line="+13"/>
+        <source>Unmute</source>
+        <translation>解除禁言</translation>
+    </message>
+    <message>
+        <location line="+10"/>
+        <source>Mute</source>
+        <translation>禁言</translation>
+    </message>
+    <message>
+        <location line="+17"/>
+        <source>10 minutes</source>
+        <translation>10 分钟</translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>1 hour</source>
+        <translation>1 小时</translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>Until unmuted</source>
+        <translation>直至解除</translation>
+    </message>
+    <message>
+        <location line="+6"/>
+        <location line="+14"/>
+        <source>Remove from room</source>
+        <translation>移出聊天室</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Remove %1 from this room?</source>
+        <translation>将 %1 移出该聊天室？</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Remove</source>
+        <translation>移除</translation>
     </message>
 </context>
 <context>
@@ -342,7 +396,7 @@
 <context>
     <name>meshlink::AccountManager</name>
     <message>
-        <location filename="../src/core/account.cpp" line="+106"/>
+        <location filename="../src/core/account.cpp" line="+453"/>
         <source>deepin-MeshLink user_</source>
         <translation>深度织讯用户_</translation>
     </message>
@@ -352,7 +406,7 @@
         <translation>昵称长度需为 2–32 个字符</translation>
     </message>
     <message>
-        <location line="+65"/>
+        <location line="+98"/>
         <source>Key generation failed</source>
         <translation>密钥生成失败</translation>
     </message>
@@ -362,7 +416,8 @@
         <translation>TLS 证书生成失败</translation>
     </message>
     <message>
-        <location line="+8"/>
+        <location line="-13"/>
+        <location line="+21"/>
         <source>Private key encryption failed</source>
         <translation>私钥加密失败</translation>
     </message>
@@ -373,12 +428,12 @@
     </message>
     <message>
         <location line="+45"/>
-        <location line="+199"/>
+        <location line="+264"/>
         <source>No local account</source>
         <translation>无账号</translation>
     </message>
     <message>
-        <location line="-182"/>
+        <location line="-193"/>
         <source>Private key decryption failed (device or credentials changed)</source>
         <translation>私钥解密失败（设备或凭据已变更）</translation>
     </message>
@@ -388,9 +443,20 @@
         <translation>密钥数据损坏</translation>
     </message>
     <message>
-        <location line="+64"/>
+        <location line="+104"/>
         <source>The avatar image could not be read</source>
         <translation>头像图片无法读取</translation>
+    </message>
+    <message>
+        <location line="+90"/>
+        <location line="+7"/>
+        <source>No local account with id %1</source>
+        <translation>本地不存在 ID 为 %1 的账号</translation>
+    </message>
+    <message>
+        <location line="+53"/>
+        <source>The account was removed, but the remaining accounts could not be verified; the local keystore was preserved</source>
+        <translation>账户已移除，但无法核实剩余账户；本地凭据库已保留</translation>
     </message>
 </context>
 <context>
@@ -507,18 +573,18 @@
     </message>
     <message>
         <location line="-81"/>
-        <location line="+462"/>
+        <location line="+476"/>
         <source>Image</source>
         <translation>图片</translation>
     </message>
     <message>
-        <location line="-591"/>
-        <location line="+725"/>
+        <location line="-605"/>
+        <location line="+745"/>
         <source>Mute notifications for this room</source>
         <translation>将该聊天室通知设为免打扰</translation>
     </message>
     <message>
-        <location line="-713"/>
+        <location line="-733"/>
         <source>Manage</source>
         <translation>管理</translation>
     </message>
@@ -539,12 +605,12 @@
     </message>
     <message>
         <location line="+14"/>
-        <location line="+458"/>
+        <location line="+472"/>
         <source>File</source>
         <translation>文件</translation>
     </message>
     <message>
-        <location line="-453"/>
+        <location line="-467"/>
         <source>Send</source>
         <translation>发送</translation>
     </message>
@@ -594,16 +660,12 @@
         <translation>你已被禁言，剩余 %1 分钟。</translation>
     </message>
     <message>
-        <location line="+81"/>
+        <location line="+88"/>
         <source>%1 (you)</source>
         <translation>%1（我）</translation>
     </message>
     <message>
-        <source>Message actions</source>
-        <translation>消息操作</translation>
-    </message>
-    <message>
-        <location line="+34"/>
+        <location line="+39"/>
         <source>Quoted message unavailable</source>
         <translation>引用的消息不可用</translation>
     </message>
@@ -640,7 +702,7 @@
         <translation>下载</translation>
     </message>
     <message>
-        <location line="+85"/>
+        <location line="+87"/>
         <source>Choose an image</source>
         <translation>选择图片</translation>
     </message>
@@ -670,7 +732,7 @@
         <translation>已撤回的消息</translation>
     </message>
     <message>
-        <location line="+136"/>
+        <location line="+142"/>
         <source>Notifications muted for this room (mentions still notify)</source>
         <translation>该聊天室通知已免打扰（@ 提及仍会通知）</translation>
     </message>
@@ -701,7 +763,7 @@
         <translation>撤回</translation>
     </message>
     <message>
-        <location line="+13"/>
+        <location line="+38"/>
         <source>A file with the same hash is already available locally.</source>
         <translation>本机已存在相同哈希的文件，无需重复下载。</translation>
     </message>
@@ -1029,9 +1091,16 @@ Make sure both nodes are on the same segment, the host is online, and both clien
 <context>
     <name>meshlink::Engine</name>
     <message>
-        <location filename="../src/core/engine.cpp" line="+171"/>
+        <location filename="../src/core/engine.cpp" line="+174"/>
         <source>Invalid LAN segment: %1/%2</source>
         <translation>无效的局域网网段：%1/%2</translation>
+    </message>
+    <message>
+        <location line="+64"/>
+        <location line="+72"/>
+        <location line="+17"/>
+        <source>No local account with id %1</source>
+        <translation>本地不存在 ID 为 %1 的账号</translation>
     </message>
 </context>
 <context>
@@ -1115,7 +1184,7 @@ Make sure both nodes are on the same segment, the host is online, and both clien
         <translation>密钥生成失败，请重试。</translation>
     </message>
     <message>
-        <location line="+35"/>
+        <location line="+36"/>
         <source>Pinned by the MESHLINK_IP environment variable</source>
         <translation>当前由 MESHLINK_IP 环境变量固定</translation>
     </message>
@@ -1130,14 +1199,14 @@ Make sure both nodes are on the same segment, the host is online, and both clien
         <translation>未发现可用 IPv4 网卡，将使用本机回环地址。</translation>
     </message>
     <message>
-        <location line="+26"/>
+        <location line="+27"/>
         <source>The local account could not be decrypted (device or credentials changed).
 Creating a new account will erase the old account&apos;s local data; this cannot be undone.</source>
         <translation>本机账户无法解密（设备或凭据已变更）。
 创建新账户将清除旧账户的本地数据，且不可恢复。</translation>
     </message>
     <message>
-        <location line="+7"/>
+        <location line="+8"/>
         <source>Startup failed</source>
         <translation>启动失败</translation>
     </message>
@@ -1165,7 +1234,7 @@ Creating a new account will erase the old account&apos;s local data; this cannot
 <context>
     <name>meshlink::MainWindow</name>
     <message>
-        <location filename="../src/ui/mainwindow.cpp" line="-72"/>
+        <location filename="../src/ui/mainwindow.cpp" line="+38"/>
         <source>Chats</source>
         <translation>会话</translation>
     </message>
@@ -1187,19 +1256,19 @@ Creating a new account will erase the old account&apos;s local data; this cannot
     <message>
         <location line="+9"/>
         <location line="+1"/>
-        <location line="+139"/>
+        <location line="+130"/>
         <location line="+97"/>
         <location line="+62"/>
         <source>Settings</source>
         <translation>设置</translation>
     </message>
     <message>
-        <location line="-250"/>
+        <location line="+46"/>
         <source>Account switch failed</source>
         <translation>账户切换失败</translation>
     </message>
     <message>
-        <location line="+28"/>
+        <location line="-268"/>
         <source>Spoofed peer suspected: %1</source>
         <translation>⚠ 检测到伪造嫌疑节点：%1</translation>
     </message>
@@ -1280,7 +1349,17 @@ Creating a new account will erase the old account&apos;s local data; this cannot
         <translation>稍后</translation>
     </message>
     <message>
-        <location line="+24"/>
+        <location line="+19"/>
+        <source>The account switch failed.</source>
+        <translation>账户切换失败。</translation>
+    </message>
+    <message>
+        <location line="+31"/>
+        <source>No local account</source>
+        <translation>无账号</translation>
+    </message>
+    <message>
+        <location line="+36"/>
         <source>Could not start the network service</source>
         <translation>无法启动网络服务</translation>
     </message>
@@ -1304,8 +1383,8 @@ Check the discovery and TLS ports in Settings, then restart the application.</so
         <translation>打开设置</translation>
     </message>
     <message>
-        <location line="-217"/>
-        <location line="+218"/>
+        <location line="-279"/>
+        <location line="+280"/>
         <source>Quit</source>
         <translation>退出</translation>
     </message>
@@ -1397,7 +1476,7 @@ Check the discovery and TLS ports in Settings, then restart the application.</so
 <context>
     <name>meshlink::ProfilePage</name>
     <message>
-        <location filename="../src/ui/profilepage.cpp" line="+45"/>
+        <location filename="../src/ui/profilepage.cpp" line="+185"/>
         <source>Profile</source>
         <translation>个人资料</translation>
     </message>
@@ -1422,7 +1501,7 @@ Check the discovery and TLS ports in Settings, then restart the application.</so
         <translation>更换头像…</translation>
     </message>
     <message>
-        <location line="+7"/>
+        <location line="+9"/>
         <location line="+1"/>
         <source>Random avatar</source>
         <translation>随机头像</translation>
@@ -1438,27 +1517,29 @@ Check the discovery and TLS ports in Settings, then restart the application.</so
         <translation>昵称</translation>
     </message>
     <message>
-        <location line="+30"/>
+        <location line="+32"/>
+        <location line="+1"/>
         <source>Copy fingerprint</source>
         <translation>复制指纹</translation>
     </message>
     <message>
-        <location line="+6"/>
+        <location line="+10"/>
         <source>Fingerprint copied to the clipboard.</source>
         <translation>指纹已复制到剪贴板。</translation>
     </message>
     <message>
-        <location line="-20"/>
+        <location line="-27"/>
+        <location line="+9"/>
         <source>Account fingerprint</source>
         <translation>账户指纹</translation>
     </message>
     <message>
-        <location line="-10"/>
+        <location line="-19"/>
         <source>LAN address</source>
         <translation>LAN 地址</translation>
     </message>
     <message>
-        <location line="+42"/>
+        <location line="+49"/>
         <source>Save</source>
         <translation>保存</translation>
     </message>
@@ -1473,22 +1554,18 @@ Check the discovery and TLS ports in Settings, then restart the application.</so
         <translation>销毁账户会安全擦除私钥与账户记录；也可同时删除聊天记录与缓存文件。</translation>
     </message>
     <message>
-        <source>Destroy account…</source>
-        <translation>销毁账户…</translation>
-    </message>
-    <message>
         <location line="+9"/>
         <source>Destroy current account…</source>
         <translation>销毁当前账户…</translation>
     </message>
     <message>
-        <location line="+39"/>
-        <location line="+8"/>
+        <location line="+44"/>
+        <location line="+17"/>
         <source>Switch account</source>
         <translation>切换账户</translation>
     </message>
     <message>
-        <location line="-7"/>
+        <location line="-16"/>
         <source>Switch the active identity to “%1”? The network reconnects with the new identity and rooms of other accounts stay untouched.</source>
         <translation>将当前身份切换为“%1”？网络将以新身份重新连接，其他账户的聊天室不受影响。</translation>
     </message>
@@ -1498,17 +1575,42 @@ Check the discovery and TLS ports in Settings, then restart the application.</so
         <translation>切换</translation>
     </message>
     <message>
-        <location line="+5"/>
+        <location line="+14"/>
         <source>The account switch failed.</source>
         <translation>账户切换失败。</translation>
     </message>
     <message>
-        <location line="+28"/>
+        <location line="+10"/>
+        <source>Identity cannot be unlocked</source>
+        <translation>身份无法解锁</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>The local keystore of “%1” cannot be decrypted on this device. Its credentials may have changed or the key material may be damaged, so this identity cannot be unlocked here.</source>
+        <translation>无法在本机解密“%1”的本地凭据库。其凭据可能已变更，或密钥材料已损坏，因此无法在此解锁该身份。</translation>
+    </message>
+    <message>
+        <location line="+9"/>
+        <source>Destroy account</source>
+        <translation>销毁账户</translation>
+    </message>
+    <message>
+        <location line="+32"/>
+        <source>The unlockable account “%1” was destroyed.</source>
+        <translation>无法解锁的账户“%1”已销毁。</translation>
+    </message>
+    <message>
+        <location line="+4"/>
+        <source>The unlockable account “%1” was removed, but the active identity or the remaining accounts could not be verified: %2</source>
+        <translation>无法解锁的账户“%1”已移除，但无法核实当前身份或剩余账户：%2</translation>
+    </message>
+    <message>
+        <location line="+32"/>
         <source>%1 · port %2</source>
         <translation>%1 · 端口 %2</translation>
     </message>
     <message>
-        <location line="+13"/>
+        <location line="+12"/>
         <source>Choose an avatar</source>
         <translation>选择头像</translation>
     </message>
@@ -1552,17 +1654,19 @@ Other accounts stay available and the next one becomes active.</source>
     <message>
         <location line="+3"/>
         <source>The private key and account record will be securely erased; this cannot be undone.
-A restart is required afterwards to create a new account.</source>
+You will return to the first-start screen to create a new identity.</source>
         <translation>私钥与账户记录将被安全擦除，此操作不可恢复。
-完成后需要重启应用以创建新账户。</translation>
+随后将返回首次启动界面以创建新身份。</translation>
     </message>
     <message>
-        <location line="+5"/>
+        <location line="-119"/>
+        <location line="+124"/>
         <source>Also delete all chat history, files and download caches</source>
         <translation>同时清除所有聊天记录、文件与下载缓存</translation>
     </message>
     <message>
-        <location line="+2"/>
+        <location line="-122"/>
+        <location line="+124"/>
         <source>Cancel</source>
         <translation>取消</translation>
     </message>
@@ -1572,7 +1676,8 @@ A restart is required afterwards to create a new account.</source>
         <translation>销毁</translation>
     </message>
     <message>
-        <location line="+6"/>
+        <location line="-103"/>
+        <location line="+110"/>
         <source>Destroy failed: %1</source>
         <translation>销毁失败：%1</translation>
     </message>
@@ -1580,7 +1685,12 @@ A restart is required afterwards to create a new account.</source>
 <context>
     <name>meshlink::RoomManager</name>
     <message>
-        <location filename="../src/core/roommanager.cpp" line="+58"/>
+        <location filename="../src/core/roommanager.cpp" line="+54"/>
+        <source>deepin-MeshLink room_</source>
+        <translation>深度织讯聊天室_</translation>
+    </message>
+    <message>
+        <location line="+11"/>
         <source>Room name must be 2–64 characters long</source>
         <translation>聊天室名称需为 2–64 个字符</translation>
     </message>
@@ -1684,7 +1794,7 @@ A restart is required afterwards to create a new account.</source>
 <context>
     <name>meshlink::RoomsView</name>
     <message>
-        <location filename="../src/ui/roomsview.cpp" line="+66"/>
+        <location filename="../src/ui/roomsview.cpp" line="+73"/>
         <location line="+260"/>
         <source>New room</source>
         <translation>新建聊天室</translation>
@@ -1760,12 +1870,12 @@ Room fingerprint: %2</source>
     </message>
     <message>
         <location line="+0"/>
-        <location line="+219"/>
+        <location line="+236"/>
         <source>Member</source>
         <translation>成员</translation>
     </message>
     <message>
-        <location line="-218"/>
+        <location line="-235"/>
         <source>Members: %1</source>
         <translation>成员：%1</translation>
     </message>
@@ -1786,8 +1896,8 @@ Room fingerprint: %2</source>
     </message>
     <message>
         <location line="+44"/>
-        <source>Room name (2–64 characters)</source>
-        <translation>聊天室名称（2–64 字符）</translation>
+        <source>Room name (2–64 characters, leave empty for a random name)</source>
+        <translation>聊天室名称（2–64 字符，留空则随机生成）</translation>
     </message>
     <message>
         <location line="+3"/>
@@ -1860,7 +1970,7 @@ Room fingerprint: %2</source>
         <translation>请将邀请码告知同一局域网网段的成员。</translation>
     </message>
     <message>
-        <location line="+16"/>
+        <location line="+23"/>
         <source>Invite code copied to the clipboard.</source>
         <translation>邀请码已复制到剪贴板。</translation>
     </message>
@@ -1871,6 +1981,11 @@ Room fingerprint: %2</source>
     </message>
     <message>
         <location line="+4"/>
+        <source>Room name</source>
+        <translation>聊天室名称</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Invite code</source>
         <translation>邀请码</translation>
     </message>
@@ -1895,17 +2010,17 @@ Room fingerprint: %2</source>
         <translation>邀请码：%1 · 房间指纹：%2</translation>
     </message>
     <message>
-        <location line="+28"/>
-        <source>Double-click a member for moderation actions.</source>
-        <translation>双击成员可执行管理操作。</translation>
+        <location line="+30"/>
+        <source>Right-click or double-click a member for moderation actions.</source>
+        <translation>右键单击或双击成员可执行管理操作。</translation>
     </message>
     <message>
-        <location line="+3"/>
+        <location line="+4"/>
         <source>Members</source>
         <translation>成员</translation>
     </message>
     <message>
-        <location line="+10"/>
+        <location line="+16"/>
         <source>Host</source>
         <translation>托管者</translation>
     </message>
@@ -1930,12 +2045,12 @@ Room fingerprint: %2</source>
         <translation>%1 · %2</translation>
     </message>
     <message>
-        <location line="+24"/>
+        <location line="+32"/>
         <source>Action rejected</source>
         <translation>操作被拒绝</translation>
     </message>
     <message>
-        <location line="+10"/>
+        <location line="+43"/>
         <location line="+4"/>
         <source>Disable global mute</source>
         <translation>关闭全员禁言</translation>

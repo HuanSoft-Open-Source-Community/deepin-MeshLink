@@ -57,6 +57,9 @@ private:
     void showSecurityWarning(const QString &text);
     void showWindow();
     void updateTrayTitle();
+    void handleAccountDestroyed(int remainingAccounts);
+    bool switchToRemainingAccount(QString *error);
+    void refreshAfterAccountChange();
 
     Engine *m_engine;
     QWidget *m_sidebar = nullptr;

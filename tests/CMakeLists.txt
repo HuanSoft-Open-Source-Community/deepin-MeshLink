@@ -16,6 +16,14 @@ add_test(NAME logic COMMAND ${MESHLINK_TEST_INTERP} $<TARGET_FILE:tst_logic>)
 set_tests_properties(logic PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu/qt6/plugins;LD_LIBRARY_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu")
 
+# --- independent keystore hardening regression (device key rotation / legacy
+#     blob rewrite guard / shared secret lifetime) ---
+add_executable(tst_keystore_guard tst_keystore_guard.cpp)
+target_link_libraries(tst_keystore_guard PRIVATE meshlink_core)
+add_test(NAME keystore_guard COMMAND ${MESHLINK_TEST_INTERP} $<TARGET_FILE:tst_keystore_guard>)
+set_tests_properties(keystore_guard PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu/qt6/plugins;LD_LIBRARY_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu")
+
 # --- multi-process integration harness over real UDP/TLS (UC-01..13) ---
 # The same binary runs as scenario driver (default) or as a scripted node
 # (--node <name> <datadir>). Nodes communicate line-JSON over stdin/stdout.
@@ -41,6 +49,36 @@ if(MESHLINK_BUILD_GUI)
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu/qt6/plugins;LD_LIBRARY_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu"
         WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
         TIMEOUT 120)
+
+    # --- independent chat/member context-menu regression (defect 4/5) ---
+    add_executable(tst_chat_menus tst_chat_menus.cpp)
+    target_link_libraries(tst_chat_menus PRIVATE meshlink_ui)
+    add_test(NAME chat_menus COMMAND ${MESHLINK_TEST_INTERP} $<TARGET_FILE:tst_chat_menus>)
+    set_tests_properties(chat_menus PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu/qt6/plugins;LD_LIBRARY_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        TIMEOUT 120)
+
+    # --- independent switch-rollback / destroy-by-id / profile prompt /
+    #     random-room-name regression (t20/t21/t22) ---
+    add_executable(tst_switch_guard tst_switch_guard.cpp)
+    target_link_libraries(tst_switch_guard PRIVATE meshlink_ui)
+    add_test(NAME switch_guard COMMAND ${MESHLINK_TEST_INTERP} $<TARGET_FILE:tst_switch_guard>)
+    set_tests_properties(switch_guard PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu/qt6/plugins;LD_LIBRARY_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        TIMEOUT 120)
+
+    # --- independent StatusNotifierItem + DBusMenu wire-format test (defect 1).
+    # The test binary starts its own /usr/bin/dbus-daemon and exports a mock
+    # org.kde.StatusNotifierWatcher, so no desktop tray host is required.
+    add_executable(tst_tray_sni tst_tray_sni.cpp)
+    target_link_libraries(tst_tray_sni PRIVATE meshlink_ui)
+    add_test(NAME tray_sni COMMAND ${MESHLINK_TEST_INTERP} $<TARGET_FILE:tst_tray_sni>)
+    set_tests_properties(tray_sni PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu/qt6/plugins;LD_LIBRARY_PATH=/opt/host-tools/usr/lib/x86_64-linux-gnu"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        TIMEOUT 180)
 endif()
 
 # --- translation completeness ---

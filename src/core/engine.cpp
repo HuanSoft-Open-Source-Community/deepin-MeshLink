@@ -4,6 +4,8 @@
 #include "engine.h"
 #include <cstdio>
 
+#include <QSet>
+#include <QSqlQuery>
 #include <QTimer>
 
 namespace meshlink {
@@ -87,6 +89,7 @@ bool Engine::hasLocalAccount() {
 
 bool Engine::start(QString *error) {
     m_startStage = StartStage::None;
+    m_lastSwitchFailure = SwitchFailure::None;
     Paths::ensureDirs();
     m_startStage = StartStage::Storage;
     if (!m_storage.open(Paths::databaseFile(), error))
@@ -148,8 +151,8 @@ bool Engine::startNetwork(QString *error) {
 }
 
 void Engine::stopNetwork() {
-    if (!m_networkRunning)
-        return;
+    // Idempotent: also cleans a partially started listener after a failed
+    // startNetwork(), where m_networkRunning is still false.
     if (m_resyncTimer)
         m_resyncTimer->stop();
     m_discovery.stop(); // signed farewell first (UC-04 A1)
@@ -190,7 +193,18 @@ bool Engine::createFreshAccount(const QString &nickname, QString *error) {
     if (!m_storage.open(Paths::databaseFile(), error))
         return false;
     if (m_account.hasAccount()) { // UC-01 A2: replace the (broken) active identity
-        m_account.destroyAccount(true, error);
+        // The broken identity may not be loaded (identity failure), so resolve
+        // it from Settings instead of wiping an empty fingerprint.
+        qint64 oldId = m_account.activeRowId();
+        if (oldId <= 0)
+            oldId = m_settings->activeAccountId();
+        if (oldId <= 0) {
+            const auto all = m_account.listAccounts();
+            if (all.size() == 1)
+                oldId = all.first().id;
+        }
+        if (oldId <= 0 || m_account.destroyAccountById(oldId, true, error) < 0)
+            return false;
     }
     const qint64 id = m_account.createNewAccount(nickname, error);
     if (id < 0)
@@ -213,26 +227,140 @@ qint64 Engine::createAdditionalAccount(const QString &nickname, QString *error) 
 }
 
 bool Engine::switchAccount(qint64 accountId, QString *error) {
-    if (!m_storage.isOpen() && !m_storage.open(Paths::databaseFile(), error))
+    m_lastSwitchFailure = SwitchFailure::None;
+    if (!m_storage.isOpen() && !m_storage.open(Paths::databaseFile(), error)) {
+        m_lastSwitchFailure = SwitchFailure::Identity;
         return false;
+    }
+    if (accountId <= 0) {
+        m_lastSwitchFailure = SwitchFailure::Identity;
+        if (error)
+            *error = tr("No local account with id %1").arg(accountId);
+        return false;
+    }
+    const qint64 previousId = m_account.activeRowId() > 0 ? m_account.activeRowId()
+                                                          : m_settings->activeAccountId();
     const bool wasRunning = m_networkRunning;
     stopNetwork();
     m_settings->setActiveAccountId(accountId);
     m_account.resetLoaded();
     m_startStage = StartStage::Identity;
-    if (!m_account.loadAccount(accountId, error)) {
-        m_startStage = StartStage::Identity;
+
+    QString switchError;
+    if (!m_account.loadAccount(accountId, &switchError)) {
+        m_lastSwitchFailure = SwitchFailure::Identity;
+        if (error)
+            *error = switchError; // report the original cause, not the rollback
+        QString rollbackError;
+        if (!restorePreviousAccount(previousId, wasRunning, &rollbackError)) {
+            qWarning("meshlink: account switch rollback failed: %s",
+                     qUtf8Printable(rollbackError));
+        }
         return false;
     }
-    if (wasRunning && !startNetwork(error))
+
+    m_startStage = StartStage::None;
+    if (wasRunning && !startNetwork(&switchError)) {
+        m_lastSwitchFailure = SwitchFailure::Network;
+        if (error)
+            *error = switchError;
+        QString rollbackError;
+        if (!restorePreviousAccount(previousId, wasRunning, &rollbackError)) {
+            qWarning("meshlink: account switch rollback failed: %s",
+                     qUtf8Printable(rollbackError));
+        }
         return false;
+    }
+
     m_rooms.resyncAll();
     emit accountSwitched(accountId);
     return true;
 }
 
+bool Engine::restorePreviousAccount(qint64 previousId, bool wasRunning, QString *error) {
+    stopNetwork(); // also cleans a partially started network from the failed target
+    m_settings->setActiveAccountId(previousId);
+    m_account.resetLoaded();
+    if (previousId > 0) {
+        QString loadError;
+        if (!m_account.loadAccount(previousId, &loadError)) {
+            if (error)
+                *error = loadError;
+            return false;
+        }
+    }
+    m_startStage = StartStage::None;
+    if (wasRunning && previousId > 0 && !startNetwork(error))
+        return false;
+    m_rooms.resyncAll();
+    if (previousId > 0)
+        emit accountSwitched(previousId);
+    return true;
+}
+
 int Engine::destroyAccount(bool alsoHistory, QString *error) {
+    const qint64 id = m_account.activeRowId() > 0 ? m_account.activeRowId()
+                                                   : m_settings->activeAccountId();
+    return destroyAccountById(id, alsoHistory, error);
+}
+
+int Engine::destroyAccountById(qint64 id, bool alsoHistory, QString *error) {
+    if (id <= 0) {
+        if (error)
+            *error = tr("No local account with id %1").arg(id);
+        return -1;
+    }
+    if (!m_storage.isOpen() && !m_storage.open(Paths::databaseFile(), error))
+        return -1;
+
+    // Validate before any side effect (leaves, download cancellation, wipe).
+    const auto accounts = m_account.listAccounts();
+    const AccountEntry *target = nullptr;
+    for (const auto &entry : accounts) {
+        if (entry.id == id) {
+            target = &entry;
+            break;
+        }
+    }
+    if (!target) {
+        if (error)
+            *error = tr("No local account with id %1").arg(id);
+        return -1;
+    }
+
+    const qint64 loadedId = m_account.activeRowId();
+    const bool active = loadedId > 0 ? (id == loadedId)
+                                     : (id == m_settings->activeAccountId());
     const bool dbg = qEnvironmentVariableIsSet("MESHLINK_DEBUG");
+
+    if (!active) {
+        // A non-active identity has no authenticated channels in this process.
+        // Sending LeaveRoom/RoomClosed under the active identity would spoof
+        // the wrong account, so the best effort here is local: cancel tasks
+        // that belong to its rooms and let the storage wipe remove its
+        // membership (and, when requested, rooms/history).
+        QSet<QString> roomIds;
+        QSqlQuery rq = m_storage.query("SELECT room_id FROM rooms WHERE owner_fp=?");
+        rq.bindValue(0, target->fingerprint);
+        if (rq.exec()) {
+            while (rq.next())
+                roomIds.insert(rq.value(0).toString());
+        }
+        for (const auto &t : m_downloader.tasks()) {
+            if (roomIds.contains(t.roomId))
+                m_downloader.cancel(t.hash, false);
+        }
+        if (dbg)
+            fprintf(stderr, "[destroy] non-active id=%lld fingerprint=%s rooms=%lld\n",
+                    (long long)id, qUtf8Printable(target->fingerprint.left(8)),
+                    (long long)roomIds.size());
+        const int remaining = m_account.destroyAccountById(id, alsoHistory, error);
+        if (dbg)
+            fprintf(stderr, "[destroy] non-active wipe done remaining=%d err=%s\n", remaining,
+                    error ? qUtf8Printable(*error) : "-");
+        return remaining;
+    }
+
     // UC-02 step 4: best-effort "leave"/"dissolve" notifications over the
     // already-established TLS channels, before the identity and its keys go.
     const auto rooms = m_rooms.myRooms();
@@ -252,7 +380,7 @@ int Engine::destroyAccount(bool alsoHistory, QString *error) {
     if (dbg)
         fprintf(stderr, "[destroy] network stopped, wiping\n");
     // Wipe while the database connection is still usable, close it afterwards.
-    const int remaining = m_account.destroyAccount(alsoHistory, error);
+    const int remaining = m_account.destroyAccountById(id, alsoHistory, error);
     if (dbg)
         fprintf(stderr, "[destroy] wipe done remaining=%d err=%s\n", remaining,
                 error ? qUtf8Printable(*error) : "-");

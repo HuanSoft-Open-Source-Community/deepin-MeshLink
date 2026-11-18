@@ -56,6 +56,9 @@ public:
 
     // ---- UC-05 ----
     QString createRoom(const QString &name, const QString &intro, JoinPolicy policy, int capacity, QString *error);
+    // Random name used when the create dialog leaves the name empty, in the
+    // same style as AccountManager::defaultNickname().
+    static QString defaultRoomName();
     // Six decimal digits (000000-999999), used for LAN-local, discovery-scoped joins.
     static bool isValidInviteCode(const QString &code);
 

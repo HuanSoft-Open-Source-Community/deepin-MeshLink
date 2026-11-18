@@ -50,9 +50,16 @@ bool RoomManager::isValidInviteCode(const QString &code) {
     return true;
 }
 
+QString RoomManager::defaultRoomName() {
+    return tr("deepin-MeshLink room_") +
+           QString::fromLatin1(Crypto::randomHex(2).c_str()).toUpper();
+}
+
 QString RoomManager::createRoom(const QString &name, const QString &intro, JoinPolicy policy, int capacity,
                                 QString *error) {
-    const QString n = name.trimmed();
+    QString n = name.trimmed();
+    if (n.isEmpty()) // UC-05: an empty name mirrors the random account nickname
+        n = defaultRoomName();
     if (n.length() < 2 || n.length() > 64) { // UC-05 step 2
         if (error)
             *error = tr("Room name must be 2–64 characters long");

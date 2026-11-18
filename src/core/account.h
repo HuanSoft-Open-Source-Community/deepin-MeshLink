@@ -62,6 +62,10 @@ public:
     // UC-02 steps 5-6 (local part): secure-erase the loaded identity, remove
     // its rows and (optionally) its rooms/history. Returns accounts left.
     int destroyAccount(bool wipeHistoryAndFiles, QString *error);
+    // Same semantics for an arbitrary account id. The active row is reset from
+    // memory; a non-active row leaves the loaded profile untouched. Returns the
+    // checked number of accounts left, or -1 on failure (unknown id included).
+    int destroyAccountById(qint64 id, bool wipeHistoryAndFiles, QString *error);
     // Same semantics for an arbitrary account (deleting a non-active one).
     bool deleteAccount(qint64 id, bool wipeHistoryAndFiles, QString *error);
 
@@ -91,8 +95,20 @@ signals:
     void profileChanged(const Profile &p);
 
 private:
-    bool persistKeystore(const Bytes &keystoreBlob, QString *error);
+    // New keystore KEK: derived from the per-install random device secret
+    // (<data>/keystore/device.key, created once) and the per-install salt.
+    // Machine-id, hostname, MAC and IP are never part of this derivation.
+    // Returns an empty vector when the local keystore is unavailable; callers
+    // must fail cleanly instead of writing a machine-bound blob.
     Bytes kek() const;
+    // Replace the encrypted keystore blob of account `id` in place (used by the
+    // legacy machine-id keystore migration after a successful decrypt).
+    bool rewriteKeystoreBlob(qint64 id, const Bytes &blob, QString *error);
+    // Shared destroy path for the active and by-id variants. `active` controls
+    // only the in-memory profile reset; the shared install secrets are removed
+    // only after the checked remaining count reaches zero.
+    int destroyAccountInternal(qint64 id, const QString &fingerprint, const QString &avatarPath,
+                               bool active, bool wipeHistoryAndFiles, QString *error);
     // Legacy single-account builds stored avatars at avatars/current.png;
     // multi-account locations are avatars/<id>.png. Moves the file if needed.
     void ensureAvatarLocation(qint64 id);

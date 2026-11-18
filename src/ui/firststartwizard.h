@@ -39,6 +39,10 @@ private:
 
     Engine *m_engine;
     bool m_addMode = false;
+    // DDialog::exec() returns the clicked button index (Create account = 0,
+    // Quit = 1), not QDialog::Accepted/Rejected. The static helpers therefore
+    // rely on this flag, which is only set after a successful creation.
+    bool m_accepted = false;
     DTK_WIDGET_NAMESPACE::DLineEdit *m_nick = nullptr;
     DTK_WIDGET_NAMESPACE::DComboBox *m_segments = nullptr;
     DTK_WIDGET_NAMESPACE::DTipLabel *m_error = nullptr;

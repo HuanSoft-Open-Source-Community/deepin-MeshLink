@@ -9,6 +9,7 @@
 #include "core/filemanager.h"
 #include "core/notifypolicy.h"
 #include "core/roommanager.h"
+#include "membermenu.h"
 #include "uiutils.h"
 
 #include <DDialog>
@@ -26,6 +27,7 @@
 #include <DToolButton>
 
 #include <QClipboard>
+#include <QContextMenuEvent>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QGuiApplication>
@@ -45,6 +47,7 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
+#include <functional>
 #include <memory>
 
 DWIDGET_USE_NAMESPACE
@@ -79,6 +82,32 @@ protected:
 
 private:
     bool m_mine;
+};
+
+// Routes the context-menu event of every bubble descendant to the message
+// actions. Selectable labels (the message text) own a text control that would
+// otherwise consume the event and show its copy/select menu; an event filter
+// sees QEvent::ContextMenu before the target widget, so the bubble wins.
+class BubbleContextMenuFilter : public QObject {
+public:
+    using OpenFn = std::function<void(const Msg &, const QPoint &)>;
+
+    BubbleContextMenuFilter(QObject *parent, Msg message, OpenFn open)
+        : QObject(parent), m_message(std::move(message)), m_open(std::move(open)) {}
+
+protected:
+    bool eventFilter(QObject *, QEvent *event) override {
+        if (event->type() == QEvent::ContextMenu) {
+            auto *menuEvent = static_cast<QContextMenuEvent *>(event);
+            m_open(m_message, menuEvent->globalPos());
+            return true;
+        }
+        return false;
+    }
+
+private:
+    Msg m_message;
+    OpenFn m_open;
 };
 
 QString statusText(quint8 status) {
@@ -557,6 +586,13 @@ QWidget *ChatView::messageRow(const Msg &message) {
     avatar->setFixedSize(36, 36);
     avatar->setPixmap(UiUtils::avatarFor(message.senderFp, avatarHash,
                                          mine ? profile.avatarPath : QString(), 36, this));
+    // The avatar owns the member menu; it must never fall through to the row
+    // and open message actions (that was the reported mis-targeting).
+    avatar->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(avatar, &QWidget::customContextMenuRequested, this,
+            [this, fp = message.senderFp, avatar](const QPoint &pos) {
+                showMemberMenu(fp, avatar->mapToGlobal(pos));
+            });
 
     auto *content = new QWidget(row);
     content->setMaximumWidth(560);
@@ -574,6 +610,11 @@ QWidget *ChatView::messageRow(const Msg &message) {
         mine ? tr("%1 (you)").arg(message.senderNick) : message.senderNick, content);
     name->setForegroundRole(DPalette::TextTitle);
     DFontSizeManager::instance()->bind(name, DFontSizeManager::T6, QFont::DemiBold);
+    name->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(name, &QWidget::customContextMenuRequested, this,
+            [this, fp = message.senderFp, name](const QPoint &pos) {
+                showMemberMenu(fp, name->mapToGlobal(pos));
+            });
     head->addWidget(name);
 
     auto *time = new DLabel(UiUtils::formattedTime(message.ts), content);
@@ -691,18 +732,20 @@ QWidget *ChatView::messageRow(const Msg &message) {
     }
     }
     }
+    // Message actions belong to the bubble only. Install the filter on the
+    // bubble and every descendant (text/quote/image/file widgets) so a
+    // right-click anywhere inside the bubble opens the same menu. The row is
+    // deliberately not wired: right-clicks on the avatar or sender name must
+    // open the member menu instead of message actions.
     bubble->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(bubble, &QWidget::customContextMenuRequested, this,
-            [this, message, bubble](const QPoint &pos) {
-                showMessageMenu(message, bubble->mapToGlobal(pos));
-            });
-    // The whole row opens the same menu: the message actions live in the
-    // context menu (there is no per-message toolbar button any more).
-    row->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(row, &QWidget::customContextMenuRequested, this,
-            [this, message, row](const QPoint &pos) {
-                showMessageMenu(message, row->mapToGlobal(pos));
-            });
+    auto *messageMenuFilter = new BubbleContextMenuFilter(
+        bubble, message, [this](const Msg &msg, const QPoint &globalPos) {
+            showMessageMenu(msg, globalPos);
+        });
+    bubble->installEventFilter(messageMenuFilter);
+    const QList<QWidget *> bubbleChildren = bubble->findChildren<QWidget *>();
+    for (QWidget *child : bubbleChildren)
+        child->installEventFilter(messageMenuFilter);
     contentLayout->addWidget(bubble);
 
     if (mine) {
@@ -949,6 +992,12 @@ void ChatView::insertMention(const QString &nickname) {
         m_mentionMenu->close();
 }
 
+void ChatView::mentionMember(const QString &nickname) {
+    if (nickname.isEmpty())
+        return;
+    insertMention(nickname);
+}
+
 void ChatView::updateDndButton() {
     if (!m_dndButton || m_roomId.isEmpty())
         return;
@@ -991,6 +1040,31 @@ void ChatView::showMessageMenu(const Msg &message, const QPoint &globalPos) {
             !error.isEmpty())
             appendNotice(error, true);
     }
+}
+
+void ChatView::showMemberMenu(const QString &targetFp, const QPoint &globalPos) {
+    if (m_roomId.isEmpty() || targetFp.isEmpty())
+        return;
+    const QString selfFp = m_engine->account()->profile().fingerprint;
+    QPointer<ChatView> guard(this);
+    QMenu *menu = MemberMenu::create(
+        this, m_engine->rooms(), m_roomId, selfFp, targetFp,
+        [guard](const QString &nickname) {
+            if (guard)
+                guard->mentionMember(nickname);
+        },
+        [guard] {
+            if (guard) {
+                guard->updateHeader();
+                guard->refreshMuteState();
+            }
+        });
+    if (!menu)
+        return;
+    // No exec(): popup() keeps the chat stream responsive and lets the menu
+    // delete itself once the user picks an action or dismisses it.
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    menu->popup(globalPos);
 }
 
 // ---- UC-10: supplier dialog + start ----
