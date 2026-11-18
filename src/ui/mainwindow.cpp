@@ -205,29 +205,14 @@ MainWindow::MainWindow(Engine *engine, QWidget *parent) : DMainWindow(parent), m
             [this](const QString &group) { openSettings(group); });
     connect(m_rooms, &RoomsView::downloadsStarted, this,
             [this] { selectPage(Page::Transfers); });
-    connect(m_profile, &ProfilePage::accountDestroyed, this, [this] {
-        // Multi-account: with other identities left, switch to the next one
-        // instead of ending the session.
-        const auto remaining = m_engine->account()->listAccounts();
-        if (!remaining.isEmpty()) {
-            QString error;
-            if (m_engine->switchAccount(remaining.first().id, &error))
-                return;
-            UiUtils::warning(this, tr("Account switch failed"), error);
-        }
-        DDialog dialog(this);
-        dialog.setTitle(QCoreApplication::translate("MainWindow", "Account destroyed"));
-        dialog.setMessage(QCoreApplication::translate(
-            "MainWindow",
-            "The local account, keys and history were erased. Restart deepin-MeshLink to create a "
-            "new account."));
-        dialog.setIcon(UiUtils::icon(QStringLiteral("dialog-information")));
-        dialog.addButton(QCoreApplication::translate("MainWindow", "Quit"), true,
-                         DDialog::ButtonNormal);
-        QObject::connect(&dialog, &DDialog::buttonClicked, &dialog,
-                         [](int, const QString &) { qApp->quit(); });
-        dialog.exec();
-    });
+    connect(m_profile, &ProfilePage::accountDestroyed, this,
+            [this](int remainingAccounts) {
+                // Let the destroy confirmation dialog finish unwinding before a
+                // possible nested modal (first-start wizard) is opened.
+                QTimer::singleShot(0, this, [this, remainingAccounts] {
+                    handleAccountDestroyed(remainingAccounts);
+                });
+            });
 
     // ---- global status / security notices ----
     setupStatusBar();
@@ -239,6 +224,12 @@ MainWindow::MainWindow(Engine *engine, QWidget *parent) : DMainWindow(parent), m
     connect(m_engine->discovery(), &Discovery::peersChanged, this, &MainWindow::refreshStatus);
     connect(m_engine->rooms(), &RoomManager::roomsChanged, this, &MainWindow::refreshStatus);
     connect(m_engine, &Engine::lanSegmentChanged, this, &MainWindow::refreshStatus);
+    connect(m_engine, &Engine::started, this, [this](bool ok) {
+        if (!ok)
+            return;
+        refreshStatus();
+        updateTrayTitle();
+    });
 
     connect(m_engine, &Engine::spoofingSuspected, this, [this](const QString &fp) {
         showSecurityWarning(tr("Spoofed peer suspected: %1").arg(UiUtils::shortFp(fp, 12)));
@@ -502,6 +493,68 @@ void MainWindow::showSecurityWarning(const QString &text) {
     m_warnLabel->setText(text);
     m_warnLabel->setToolTip(text);
     m_warnLabel->show();
+}
+
+void MainWindow::handleAccountDestroyed(int remainingAccounts) {
+    if (remainingAccounts > 0) {
+        // Multi-account: keep the session alive on a surviving identity.
+        QString error;
+        if (!switchToRemainingAccount(&error)) {
+            UiUtils::warning(this, tr("Account switch failed"),
+                             error.isEmpty() ? tr("The account switch failed.") : error);
+        }
+        refreshAfterAccountChange();
+        return;
+    }
+
+    // UC-02 step 7: with no identity left the app returns to the first-start
+    // state in-process. Storage was closed by Engine::destroyAccount(); the
+    // wizard's create flow reopens it and generates a fresh identity.
+    if (!FirstStartWizard::ensureAccount(m_engine, this)) {
+        // The wizard's "Quit" button (or closing it) is the only explicit way
+        // to leave here; destroying an account must never quit on its own.
+        qApp->quit();
+        return;
+    }
+    QString error;
+    const bool started = m_engine->start(&error);
+    refreshAfterAccountChange();
+    if (!started)
+        showStartupError(error);
+}
+
+bool MainWindow::switchToRemainingAccount(QString *error) {
+    // Engine::destroyAccount() closes storage while wiping, so the account
+    // table cannot be queried until it is reopened.
+    if (!m_engine->storage()->isOpen()
+        && !m_engine->storage()->open(Paths::databaseFile(), error))
+        return false;
+    const auto remaining = m_engine->account()->listAccounts();
+    if (remaining.isEmpty()) {
+        if (error)
+            *error = tr("No local account");
+        return false;
+    }
+    if (!m_engine->switchAccount(remaining.first().id, error))
+        return false;
+    // destroyAccount() stopped networking; switchAccount() only rebinds when
+    // the network was running, so bring it back on the surviving identity.
+    if (!m_engine->networkRunning() && !m_engine->start(error))
+        return false;
+    return true;
+}
+
+void MainWindow::refreshAfterAccountChange() {
+    // @-mention badges and the tray title belong to the previous identity.
+    m_unreadMentions = 0;
+    if (m_notifier)
+        m_notifier->clearAll();
+    if (m_profile)
+        m_profile->reload();
+    if (m_rooms)
+        m_rooms->setMentionCounts({}); // public entry point re-renders the room list
+    refreshStatus();
+    updateTrayTitle();
 }
 
 void MainWindow::showStartupError(const QString &error) {

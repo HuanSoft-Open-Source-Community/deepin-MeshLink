@@ -4,8 +4,11 @@
 #include "roomsview.h"
 
 #include "chatview.h"
+#include "core/account.h"
+#include "core/chatmanager.h"
 #include "core/engine.h"
 #include "core/roommanager.h"
+#include "membermenu.h"
 #include "uiutils.h"
 
 #include <DComboBox>
@@ -30,14 +33,18 @@
 #include <QClipboard>
 #include <QGuiApplication>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QItemSelectionModel>
 #include <QMenu>
 #include <QPointer>
+#include <QSet>
 #include <QSplitter>
 #include <QStandardItemModel>
 #include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
+
+#include <memory>
 
 DWIDGET_USE_NAMESPACE
 DGUI_USE_NAMESPACE
@@ -332,7 +339,7 @@ void RoomsView::openCreateDialog() {
     form->setSpacing(12);
 
     auto *name = new DLineEdit(content);
-    name->setPlaceholderText(tr("Room name (2–64 characters)"));
+    name->setPlaceholderText(tr("Room name (2–64 characters, leave empty for a random name)"));
     name->lineEdit()->setMaxLength(64);
     auto *intro = new DLineEdit(content);
     intro->setPlaceholderText(tr("Description (optional)"));
@@ -385,6 +392,13 @@ void RoomsView::openCreateDialog() {
             form->setContentsMargins(0, 0, 0, 0);
             form->setSpacing(10);
 
+            // Show which name the room actually got, which matters when the
+            // create dialog left the field empty and a random name was chosen.
+            auto *roomName = new DLineEdit(box);
+            roomName->setObjectName(QStringLiteral("roomsView.createdRoomName"));
+            roomName->lineEdit()->setReadOnly(true);
+            roomName->setText(created.name);
+
             auto *code = new DLineEdit(box);
             code->lineEdit()->setReadOnly(true);
             code->setText(created.inviteCode);
@@ -409,6 +423,7 @@ void RoomsView::openCreateDialog() {
             });
             fingerprint->setRightWidgets({copyFingerprint});
 
+            form->addRow(tr("Room name"), roomName);
             form->addRow(tr("Invite code"), code);
             form->addRow(tr("Room fingerprint"), fingerprint);
             box->setMinimumWidth(440);
@@ -462,19 +477,28 @@ void RoomsView::openManagementDialog(const QString &roomId) {
     members->setItemMargins(QMargins(10, 6, 10, 6));
     members->setItemSpacing(3);
     members->setItemRadius(8);
+    members->setIconSize(QSize(32, 32));
+    members->setContextMenuPolicy(Qt::CustomContextMenu);
     auto *membersModel = new QStandardItemModel(members);
     members->setModel(membersModel);
     membersLayout->addWidget(members, 1);
 
-    auto *hint = new DLabel(tr("Double-click a member for moderation actions."), membersPage);
+    auto *hint = new DLabel(tr("Right-click or double-click a member for moderation actions."),
+                            membersPage);
     hint->setForegroundRole(DPalette::TextTips);
     membersLayout->addWidget(hint);
     tabs->addTab(membersPage, tr("Members"));
 
     const bool iAmHost = room.hosted;
     const bool iAmAdmin = m_engine->rooms()->myRole(roomId) == MemberRole::Admin;
+    const QString selfFp = m_engine->account()->profile().fingerprint;
+    // Avatar blobs arrive asynchronously; request each hash once per dialog.
+    auto requestedAvatars = std::make_shared<QSet<QString>>();
+    // A mention picked in the dialog is applied after exec() returns, when the
+    // modal window is gone and the composer can really take keyboard focus.
+    QString pendingMention;
 
-    auto fillMembers = [this, roomId, membersModel] {
+    auto fillMembers = [this, roomId, membersModel, members, requestedAvatars] {
         membersModel->clear();
         const QVector<RoomMemberInfo> list = m_engine->rooms()->members(roomId);
         for (const RoomMemberInfo &member : list) {
@@ -494,6 +518,14 @@ void RoomsView::openManagementDialog(const QString &roomId) {
                 tr("%1 · %2").arg(member.nickname, role));
             item->setData(member.fp, Qt::UserRole);
             item->setData(int(member.role), Qt::UserRole + 1);
+            if (!member.avatarHash.isEmpty() && !ChatManager::hasBlob(member.avatarHash) &&
+                !requestedAvatars->contains(member.avatarHash)) {
+                requestedAvatars->insert(member.avatarHash);
+                m_engine->chat()->requestBlob(member.avatarHash, member.fp);
+            }
+            item->setData(QVariant::fromValue(QIcon(UiUtils::avatarFor(
+                              member.fp, member.avatarHash, QString(), 32, members))),
+                          Qt::DecorationRole);
             QStringList meta;
             meta << UiUtils::shortFp(member.fp, 12);
             if (!mute.isEmpty())
@@ -519,6 +551,39 @@ void RoomsView::openManagementDialog(const QString &roomId) {
                 fillMembers();
             });
     };
+
+    // Same member menu as the chat pane: right-click a member row/avatar.
+    connect(members, &DListView::customContextMenuRequested, &dialog,
+            [this, &dialog, members, roomId, selfFp, fillMembers,
+             &pendingMention](const QPoint &pos) {
+                const QModelIndex index = members->indexAt(pos);
+                const QString target =
+                    index.isValid() ? index.data(Qt::UserRole).toString() : QString();
+                if (target.isEmpty())
+                    return;
+                QPointer<QDialog> guard(&dialog);
+                QMenu *menu = MemberMenu::create(
+                    &dialog, m_engine->rooms(), roomId, selfFp, target,
+                    [guard, &pendingMention](const QString &nickname) {
+                        pendingMention = nickname;
+                        if (guard)
+                            guard->accept();
+                    },
+                    [this, guard, fillMembers] {
+                        if (!guard)
+                            return;
+                        fillMembers();
+                        refreshRooms();
+                    });
+                if (!menu)
+                    return;
+                menu->setAttribute(Qt::WA_DeleteOnClose);
+                menu->popup(members->viewport()->mapToGlobal(pos));
+            });
+
+    // Avatar blobs are fetched on demand: repaint the member rows when they land.
+    connect(m_engine->chat(), &ChatManager::blobReady, &dialog,
+            [fillMembers](const QString &) { fillMembers(); });
 
     // host/admin toolbar
     if (iAmHost || iAmAdmin) {
@@ -691,6 +756,16 @@ void RoomsView::openManagementDialog(const QString &roomId) {
     });
 
     dialog.exec();
+
+    if (!pendingMention.isEmpty()) {
+        const QString nickname = pendingMention;
+        // Queue past the dialog teardown so focus lands on the composer.
+        QTimer::singleShot(0, this, [this, roomId, nickname] {
+            selectRoom(roomId);
+            if (m_chat)
+                m_chat->mentionMember(nickname);
+        });
+    }
 }
 
 } // namespace meshlink

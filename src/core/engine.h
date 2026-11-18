@@ -49,9 +49,18 @@ public:
     // network rebinds to it in place when the engine is already running.
     qint64 createAdditionalAccount(const QString &nickname, QString *error);
     // Multi-account: switch the active identity (stops/restarts networking).
+    // On any failure the previous identity, active id and network state are
+    // restored; lastSwitchFailure() tells the UI which step failed without
+    // parsing translated error strings.
     bool switchAccount(qint64 accountId, QString *error);
+    enum class SwitchFailure { None, Identity, Network };
+    SwitchFailure lastSwitchFailure() const { return m_lastSwitchFailure; }
     // UC-02: destroy local account, keys and history.
     int destroyAccount(bool alsoHistory, QString *error);
+    // Destroy an arbitrary local account. A non-active account is removed
+    // without stopping the network or dropping the loaded identity; the active
+    // account keeps the historical stop/wipe/close behaviour.
+    int destroyAccountById(qint64 id, bool alsoHistory, QString *error);
     bool networkRunning() const { return m_networkRunning; }
 
     // Deliver a frame to `fp`, dialing on demand when no channel is open yet.
@@ -84,6 +93,9 @@ private:
     // must already be loaded when this runs.
     bool startNetwork(QString *error);
     void stopNetwork();
+    // Reload `previousId`, restore Settings and (when it was running before)
+    // restart networking. Used as the rollback path of switchAccount().
+    bool restorePreviousAccount(qint64 previousId, bool wasRunning, QString *error);
 
     Settings *m_settings;
     Storage m_storage;
@@ -98,6 +110,7 @@ private:
     QString m_lanIp;
     qint64 m_lastResyncMs = 0;
     StartStage m_startStage = StartStage::None;
+    SwitchFailure m_lastSwitchFailure = SwitchFailure::None;
     bool m_networkRunning = false;
     QTimer *m_resyncTimer = nullptr;
 };

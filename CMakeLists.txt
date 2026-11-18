@@ -121,6 +121,7 @@ set(UI_SOURCES
     src/ui/profilepage.cpp
     src/ui/roomsview.cpp
     src/ui/chatview.cpp
+    src/ui/membermenu.cpp
     src/ui/discoverview.cpp
     src/ui/transfersview.cpp
     src/ui/settingsdialog.cpp
@@ -137,6 +138,7 @@ set(UI_HEADERS
     src/ui/profilepage.h
     src/ui/roomsview.h
     src/ui/chatview.h
+    src/ui/membermenu.h
     src/ui/discoverview.h
     src/ui/transfersview.h
     src/ui/settingsdialog.h

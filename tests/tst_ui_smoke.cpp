@@ -2,10 +2,14 @@
 // geometry regression and optional light/dark screenshots.
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 HuanSoft Open Source Community <https://huansoft.org.cn>
+#include "core/account.h"
+#include "core/crypto.h"
 #include "core/engine.h"
 #include "core/settings.h"
-#include "ui/mainwindow.h"
+#include "core/storage.h"
 #include "ui/firststartwizard.h"
+#include "ui/mainwindow.h"
+#include "ui/profilepage.h"
 #include "ui/roomsview.h"
 #include "ui/settingsdialog.h"
 
@@ -20,14 +24,21 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QFile>
+#include <QFileInfo>
 #include <QHostAddress>
+#include <QIcon>
+#include <QImage>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QListView>
+#include <QPixmap>
 #include <QSpinBox>
+#include <QSqlQuery>
 #include <QTextEdit>
 #include <QTcpServer>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QTimer>
 #include <QToolButton>
 #include <QUdpSocket>
@@ -109,6 +120,204 @@ void saveSnapshot(QWidget *widget, const QString &directory, const QString &name
     widget->grab().save(directory + QLatin1Char('/') + name + QStringLiteral(".png"));
 }
 
+// Deterministic wait helper: the account-destroy flow runs asynchronous
+// recovery (timer-deferred handler, modal wizard, Engine::start), so fixed
+// sleeps would either be flaky or slow.
+template <typename Predicate>
+bool waitUntil(Predicate predicate, int timeoutMs) {
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeoutMs) {
+        if (predicate())
+            return true;
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        QThread::msleep(5);
+    }
+    return predicate();
+}
+
+QByteArray readBytes(const QString &path) {
+    QFile file(path);
+    return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+}
+
+meshlink::Bytes bytesOf(const QByteArray &data) {
+    return meshlink::Bytes(reinterpret_cast<const uint8_t *>(data.constData()),
+                           reinterpret_cast<const uint8_t *>(data.constData()) + data.size());
+}
+
+bool iconPaintsPixels(const QIcon &icon) {
+    if (icon.isNull())
+        return false;
+    const QPixmap pixmap = icon.pixmap(QSize(24, 24));
+    if (pixmap.isNull())
+        return false;
+    const QImage image = pixmap.toImage();
+    int painted = 0;
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            if (image.pixelColor(x, y).alpha() > 0)
+                ++painted;
+        }
+    }
+    return painted > 10;
+}
+
+QWidget *visibleModal() {
+    if (QWidget *active = QApplication::activeModalWidget())
+        return active;
+    for (QWidget *widget : QApplication::topLevelWidgets()) {
+        auto *dialog = qobject_cast<QDialog *>(widget);
+        if (dialog && dialog->isVisible())
+            return dialog;
+    }
+    return nullptr;
+}
+
+bool clickDialogButton(QWidget *root, const QString &text) {
+    if (!root)
+        return false;
+    // DTK inserts visual spacing between CJK glyphs ("销 毁"), and mnemonics
+    // add '&'; normalise both sides before matching so the test is locale
+    // independent.
+    const auto normalise = [](const QString &value) {
+        QString out;
+        for (const QChar character : value) {
+            if (character != QLatin1Char('&') && !character.isSpace())
+                out.append(character);
+        }
+        return out;
+    };
+    const QString wanted = normalise(text);
+    for (QAbstractButton *button : root->findChildren<QAbstractButton *>()) {
+        if (normalise(button->text()) == wanted) {
+            button->click();
+            return true;
+        }
+    }
+    return false;
+}
+
+// Autopilot for the modal dialogs of the destroy/re-create flow.
+bool g_wizardSeen = false;
+bool g_wizardAccepted = false;
+int g_unexpectedDialogs = 0;
+
+void accountFlowAutopilot() {
+    QWidget *modal = visibleModal();
+    if (!modal)
+        return;
+    if (qobject_cast<meshlink::FirstStartWizard *>(modal)) {
+        g_wizardSeen = true;
+        // The test installs the application translator, so match the string
+        // through the same translation context the widget uses.
+        if (clickDialogButton(
+                modal, QCoreApplication::translate("meshlink::FirstStartWizard", "Create account"))) {
+            g_wizardAccepted = true;
+            std::printf("account-flow: first-start wizard 'Create account' clicked\n");
+        }
+        return;
+    }
+    if (clickDialogButton(modal, QCoreApplication::translate("meshlink::ProfilePage", "Destroy"))) {
+        std::printf("account-flow: destroy confirmed in '%s'\n",
+                    qUtf8Printable(modal->windowTitle()));
+        return;
+    }
+    if (clickDialogButton(modal, QCoreApplication::translate("UiUtils", "OK"))) {
+        ++g_unexpectedDialogs;
+        std::fprintf(stderr, "account-flow: unexpected OK dialog '%s'\n",
+                     qUtf8Printable(modal->windowTitle()));
+        return;
+    }
+    ++g_unexpectedDialogs;
+    QStringList labels;
+    for (QAbstractButton *button : modal->findChildren<QAbstractButton *>())
+        labels << QStringLiteral("'%1'").arg(button->text());
+    std::fprintf(stderr,
+                 "account-flow: unexpected dialog class=%s title='%s' buttons=[%s] closed\n",
+                 modal->metaObject()->className(), qUtf8Printable(modal->windowTitle()),
+                 qUtf8Printable(labels.join(QStringLiteral(", "))));
+    modal->close();
+}
+
+// Independent credential check: the on-disk keystore must open with only the
+// per-install device secret + salt. No machine-id, hostname, MAC or IP may
+// participate, so a simulated machine/hostname change and a network change must
+// leave loadAccount() working and the blob byte-identical.
+void checkKeystoreStability() {
+    QTemporaryDir home;
+    require(home.isValid(), "keystore check: temporary data directory");
+    qputenv("MESHLINK_DATA_HOME", home.filePath(QStringLiteral("data")).toUtf8());
+    qputenv("MESHLINK_CONFIG_HOME", home.filePath(QStringLiteral("config")).toUtf8());
+
+    meshlink::Storage storage;
+    QString error;
+    require(storage.open(home.filePath(QStringLiteral("keystore-check.db")), &error),
+            qUtf8Printable(QStringLiteral("keystore check: open database: %1").arg(error)));
+    meshlink::AccountManager accounts(&storage);
+    const qint64 id = accounts.createNewAccount(QStringLiteral("Stable Account"), &error);
+    require(id > 0,
+            qUtf8Printable(QStringLiteral("keystore check: create account: %1").arg(error)));
+    const QString fingerprint = accounts.profile().fingerprint;
+    require(fingerprint.size() == 32, "keystore check: fingerprint is 32 chars");
+
+    QSqlQuery blobQuery = storage.query(QStringLiteral("SELECT keystore_blob FROM account WHERE id=?"));
+    blobQuery.bindValue(0, id);
+    require(blobQuery.exec() && blobQuery.next(), "keystore check: keystore blob stored");
+    const QByteArray blob = blobQuery.value(0).toByteArray();
+    const QByteArray deviceKey = readBytes(meshlink::Paths::keystoreDeviceKey());
+    const QByteArray salt = readBytes(meshlink::Paths::keystoreSalt());
+    require(deviceKey.size() == 32, "keystore check: device secret is 32 bytes");
+    require(salt.size() == 16, "keystore check: install salt is 16 bytes");
+    require(!blob.isEmpty() && !blob.contains("PRIVATE KEY"),
+            "keystore check: private key material is encrypted");
+
+    // The blob must decrypt with KEK(device.key, salt) alone. If any machine
+    // or network identifier participated, this independent decryption would
+    // fail even though the same C++ process created the blob.
+    const meshlink::Bytes kek =
+        meshlink::Crypto::deriveKek(bytesOf(deviceKey), bytesOf(salt));
+    require(kek.size() == 32, "keystore check: KEK derives from device key + salt");
+    const auto plain = meshlink::Crypto::aesGcmDecrypt(bytesOf(blob), kek);
+    require(plain.has_value() && plain->size() >= 68,
+            "keystore check: blob decrypts with device-key KEK only");
+
+    // Simulate a machine-id/hostname change (the legacy derivation's factor)
+    // plus a LAN / configuration move, then reload from a fresh connection.
+    qputenv("MESHLINK_LEGACY_MACHINE_FACTOR", QByteArray("independent-other-machine-id"));
+    qputenv("MESHLINK_IP", "10.77.0.9");
+    accounts.resetLoaded();
+    require(accounts.loadAccount(id, &error),
+            qUtf8Printable(QStringLiteral("keystore check: loadAccount after machine change: %1")
+                               .arg(error)));
+    require(accounts.profile().fingerprint == fingerprint,
+            "keystore check: identity survives the simulated machine change");
+    require(readBytes(meshlink::Paths::keystoreDeviceKey()) == deviceKey,
+            "keystore check: device secret was not rewritten");
+    QSqlQuery unchanged = storage.query(QStringLiteral("SELECT keystore_blob FROM account WHERE id=?"));
+    unchanged.bindValue(0, id);
+    require(unchanged.exec() && unchanged.next(), "keystore check: blob re-read");
+    require(unchanged.value(0).toByteArray() == blob,
+            "keystore check: keystore blob is byte-identical after the change");
+
+    // Fresh process-like state: new connection + new AccountManager.
+    storage.close();
+    require(true, "keystore check: close first database connection");
+    meshlink::Storage reopened;
+    require(reopened.open(home.filePath(QStringLiteral("keystore-check.db")), &error),
+            qUtf8Printable(QStringLiteral("keystore check: reopen database: %1").arg(error)));
+    meshlink::AccountManager second(&reopened);
+    require(second.loadAccount(id, &error),
+            qUtf8Printable(QStringLiteral("keystore check: fresh-manager loadAccount: %1")
+                               .arg(error)));
+    require(second.profile().fingerprint == fingerprint,
+            "keystore check: fresh manager decrypts the same identity");
+    reopened.close();
+
+    qunsetenv("MESHLINK_LEGACY_MACHINE_FACTOR");
+    std::printf("keystore check: device-key KEK only; machine/hostname/IP changes survived\n");
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -120,6 +329,11 @@ int main(int argc, char *argv[]) {
     app.loadTranslator();
     app.setApplicationDisplayName(QCoreApplication::translate("main", "deepin-MeshLink"));
     DGuiApplicationHelper::setAttribute(DGuiApplicationHelper::DontSaveApplicationTheme, true);
+
+    // Independent t4 check runs against its own data home before the UI test
+    // switches MESHLINK_* to the main fixture.
+    checkKeystoreStability();
+    qunsetenv("MESHLINK_LEGACY_MACHINE_FACTOR");
 
     QTemporaryDir temp;
     require(temp.isValid(), "could not create a temporary directory");
@@ -448,6 +662,145 @@ int main(int argc, char *argv[]) {
     require(messageCount() == before + 1, "Ctrl+Enter did not send the message");
     settings.setSendWithEnter(true);
     processEventsFor(100);
+
+    // ---- random-avatar button + account destroy recovery (defects 2/3) ------
+    // The profile combo/avatar widgets are re-queried after every account
+    // transition on purpose: the contract is a refreshed user-visible window,
+    // not just engine state.
+    window.selectPage(meshlink::MainWindow::Page::Profile);
+    processEventsFor(250);
+    auto *profilePage = window.findChild<meshlink::ProfilePage *>();
+    require(profilePage != nullptr, "profile page is missing");
+    auto *randomAvatarButton =
+        window.findChild<QAbstractButton *>(QStringLiteral("profilePage.randomAvatarButton"));
+    auto *profileCombo =
+        window.findChild<QComboBox *>(QStringLiteral("profilePage.accountCombo"));
+    auto *saveButton =
+        window.findChild<QAbstractButton *>(QStringLiteral("profilePage.saveButton"));
+    auto *destroyButton =
+        window.findChild<QAbstractButton *>(QStringLiteral("profilePage.destroyButton"));
+    require(randomAvatarButton != nullptr, "random avatar button is missing");
+    require(profileCombo != nullptr, "account combo is missing");
+    require(saveButton != nullptr, "profile save button is missing");
+    require(destroyButton != nullptr, "account destroy button is missing");
+
+    require(randomAvatarButton->isVisibleTo(&window), "random avatar button is not visible");
+    require(randomAvatarButton->width() >= 32 && randomAvatarButton->height() >= 32,
+            "random avatar button is smaller than 32x32");
+    require(!randomAvatarButton->icon().isNull(), "random avatar button has a null icon");
+    require(iconPaintsPixels(randomAvatarButton->icon()),
+            "random avatar button icon renders no painted pixels");
+    require(!randomAvatarButton->toolTip().isEmpty(), "random avatar button has no tooltip");
+    require(!randomAvatarButton->accessibleName().isEmpty(),
+            "random avatar button has no accessible name");
+    std::printf("avatar-button: %dx%d iconSize=%dx%d tooltip='%s' a11y='%s'\n",
+                randomAvatarButton->width(), randomAvatarButton->height(),
+                randomAvatarButton->iconSize().width(), randomAvatarButton->iconSize().height(),
+                qUtf8Printable(randomAvatarButton->toolTip()),
+                qUtf8Printable(randomAvatarButton->accessibleName()));
+
+    QLabel *avatarPreview = nullptr;
+    for (QLabel *label : profilePage->findChildren<QLabel *>()) {
+        if (label->width() == 96 && label->height() == 96) {
+            avatarPreview = label;
+            break;
+        }
+    }
+    require(avatarPreview != nullptr, "profile avatar preview label is missing");
+    const QImage avatarBefore = avatarPreview->pixmap(Qt::ReturnByValue).toImage();
+    const QString hashBefore = engine.account()->profile().avatarHash;
+    const int randomFilesBefore =
+        QDir(meshlink::Paths::avatarDir())
+            .entryList({QStringLiteral("random-*.png")}, QDir::Files)
+            .size();
+    randomAvatarButton->click();
+    processEventsFor(300);
+    const int randomFilesAfter =
+        QDir(meshlink::Paths::avatarDir())
+            .entryList({QStringLiteral("random-*.png")}, QDir::Files)
+            .size();
+    require(randomFilesAfter == randomFilesBefore + 1,
+            "random-avatar click generated no identicon file");
+    require(avatarPreview->pixmap(Qt::ReturnByValue).toImage() != avatarBefore,
+            "random-avatar click did not change the preview");
+    saveButton->click();
+    processEventsFor(450);
+    const meshlink::Profile profileAfterSave = engine.account()->profile();
+    require(!profileAfterSave.avatarHash.isEmpty() && profileAfterSave.avatarHash != hashBefore,
+            "Save did not persist a new avatar hash");
+    require(QFileInfo::exists(profileAfterSave.avatarPath),
+            "saved avatar file does not exist");
+    bool accountRowHashMatches = false;
+    for (const meshlink::AccountEntry &entry : engine.account()->listAccounts()) {
+        if (entry.id == engine.account()->activeRowId())
+            accountRowHashMatches = entry.avatarHash == profileAfterSave.avatarHash;
+    }
+    require(accountRowHashMatches, "avatar hash is not stored with the account row");
+
+    // Destroy one of two accounts: the surviving identity is switched to and
+    // networking comes back without touching the application lifetime.
+    const qint64 alphaId = engine.account()->activeRowId();
+    const QString alphaNickname = engine.account()->profile().nickname;
+    const qint64 betaId =
+        engine.createAdditionalAccount(QStringLiteral("Smoke Beta"), &error);
+    require(betaId > 0,
+            qUtf8Printable(QStringLiteral("could not create the second account: %1").arg(error)));
+    require(engine.account()->activeRowId() == betaId,
+            "second account did not become active");
+    profilePage->reload();
+    processEventsFor(250);
+    require(profileCombo->count() == 2, "account combo does not list both accounts");
+
+    QTimer accountAutopilot;
+    QObject::connect(&accountAutopilot, &QTimer::timeout, &accountFlowAutopilot);
+    accountAutopilot.start(30);
+
+    std::printf("account-flow: clicking destroy for the current of two accounts\n");
+    destroyButton->click(); // autopilot confirms "Destroy"
+    require(waitUntil([&] { return engine.account()->listAccounts().size() == 1; }, 8000),
+            "destroying one of two accounts did not leave one account");
+    require(waitUntil([&] { return engine.account()->activeRowId() == alphaId; }, 8000),
+            "the surviving account did not become active");
+    require(waitUntil([&] { return engine.networkRunning(); }, 8000),
+            "networking did not restart on the surviving account");
+    require(engine.account()->profile().nickname == alphaNickname,
+            "stale profile after destroying the other account");
+    require(profileCombo->count() == 1
+                && profileCombo->currentText().contains(alphaNickname),
+            "account combo was not refreshed to the surviving account");
+    require(window.isVisible(), "window disappeared after destroying one account");
+    std::printf("account-flow: destroyed one of two accounts, switched to '%s'\n",
+                qUtf8Printable(alphaNickname));
+
+    // Destroy the last account: the wizard must appear in-process; completing
+    // it must produce a running engine and a refreshed window (no forced quit).
+    const QString oldFingerprint = engine.account()->profile().fingerprint;
+    g_wizardSeen = false;
+    g_wizardAccepted = false;
+    g_unexpectedDialogs = 0;
+    destroyButton->click(); // autopilot confirms, then completes the wizard
+    require(waitUntil([&] { return g_wizardSeen; }, 8000),
+            "first-start wizard did not appear after destroying the last account");
+    require(waitUntil([&] { return engine.account()->listAccounts().size() == 1; }, 12000),
+            "completing the first-start wizard created no account");
+    require(waitUntil([&] { return engine.networkRunning(); }, 10000),
+            "engine did not start for the re-created identity");
+    require(waitUntil([&] { return profileCombo->count() == 1; }, 5000),
+            "account combo was not refreshed after re-creation");
+    const QString newFingerprint = engine.account()->profile().fingerprint;
+    require(newFingerprint.size() == 32 && newFingerprint != oldFingerprint,
+            "re-created identity does not have a fresh fingerprint");
+    require(profileCombo->currentText().contains(newFingerprint.left(12)),
+            "account combo does not show the new fingerprint");
+    require(engine.account()->profile().nickname != alphaNickname,
+            "stale nickname after re-creating the identity");
+    require(window.isVisible(), "window disappeared after re-creating the identity");
+    require(g_wizardAccepted, "the first-start wizard was not completed explicitly");
+    require(g_unexpectedDialogs == 0, "the account-destroy flow needed unexpected dialogs");
+    accountAutopilot.stop();
+    std::printf("account-flow: last account destroyed, wizard re-created fp=%s, network=%s\n",
+                qUtf8Printable(newFingerprint.left(12)),
+                engine.networkRunning() ? "running" : "stopped");
 
     // ---- close action: pin "minimize to tray" before closing. The fresh
     // profile default is "ask", whose confirmation dialog runs a blocking

@@ -7,6 +7,7 @@
 #include "lansegment.h"
 
 #include <QDir>
+#include <QFile>
 #include <QStandardPaths>
 
 namespace meshlink {
@@ -33,6 +34,7 @@ QString configRoot() {
 QString databaseFile() { return dataRoot() + "/meshlink.db"; }
 QString keystoreFile() { return dataRoot() + "/keystore/identity.bin"; }
 QString keystoreSalt() { return dataRoot() + "/keystore/salt"; }
+QString keystoreDeviceKey() { return dataRoot() + "/keystore/device.key"; }
 QString avatarDir() { return dataRoot() + "/avatars"; }
 QString blobDir() { return dataRoot() + "/blobs"; }
 QString downloadDir() { return dataRoot() + "/downloads"; }
@@ -43,6 +45,10 @@ void ensureDirs() {
                              blobDir(), downloadDir(), fileDir(), logDir()}) {
         QDir().mkpath(d);
     }
+    // The keystore directory holds the salt and the per-install device secret;
+    // restrict it to the owner (0700) on every start.
+    QFile::setPermissions(dataRoot() + "/keystore",
+                          QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
 }
 } // namespace Paths
 

@@ -11,6 +11,7 @@ class QLabel;
 
 DWIDGET_BEGIN_NAMESPACE
 class DComboBox;
+class DLabel;
 class DLineEdit;
 DWIDGET_END_NAMESPACE
 
@@ -23,8 +24,14 @@ class ProfilePage : public QWidget {
 public:
     explicit ProfilePage(Engine *engine, QWidget *parent = nullptr);
 
+    // Re-read the active identity: account combo + editable profile fields.
+    void reload();
+
 signals:
-    void accountDestroyed();
+    // `remainingAccounts` is Engine::destroyAccount()'s return value; querying
+    // the account table is impossible at this point because the engine closes
+    // storage right after wiping the identity.
+    void accountDestroyed(int remainingAccounts);
 
 private:
     void load();
@@ -34,11 +41,14 @@ private:
     void randomAvatar();
     void refreshAccounts();
     void onAccountComboChanged(int index);
+    // A failed switch because the target keystore cannot be decrypted on this
+    // device: offer to remove that dead identity without touching the active one.
+    void offerDestroyUnlockable(qint64 accountId, const QString &nickname);
 
     Engine *m_engine;
     QLabel *m_avatar = nullptr;
     DTK_WIDGET_NAMESPACE::DLineEdit *m_nick = nullptr;
-    DTK_WIDGET_NAMESPACE::DLineEdit *m_fp = nullptr;
+    DTK_WIDGET_NAMESPACE::DLabel *m_fp = nullptr;
     DTK_WIDGET_NAMESPACE::DLineEdit *m_ip = nullptr;
     DTK_WIDGET_NAMESPACE::DComboBox *m_accountCombo = nullptr;
     QString m_pendingAvatar; // chosen file, applied on save

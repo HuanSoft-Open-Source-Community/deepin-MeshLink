@@ -10,6 +10,7 @@
 #include "uiutils.h"
 
 #include <DComboBox>
+#include <DDciIcon>
 #include <DDialog>
 #include <DFontSizeManager>
 #include <DFrame>
@@ -17,6 +18,7 @@
 #include <DLabel>
 #include <DLineEdit>
 #include <DMessageManager>
+#include <DPaletteHelper>
 #include <DPushButton>
 #include <DSuggestButton>
 #include <DWarningButton>
@@ -24,19 +26,157 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QDir>
+#include <QFontDatabase>
+#include <QFontMetrics>
 #include <QFormLayout>
 #include <QGuiApplication>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPixmap>
 #include <QRandomGenerator>
+#include <QResizeEvent>
 #include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QVBoxLayout>
 
 DWIDGET_USE_NAMESPACE
 DGUI_USE_NAMESPACE
 
 namespace meshlink {
+
+namespace {
+
+// Theme icons are not guaranteed: uninstalled builds, minimal icon themes and
+// headless sessions can all return a null QIcon, and a flat DIconButton with a
+// null icon paints nothing (the button then looks missing). Resolve the refresh
+// glyph through every available source and finally draw one, so the control is
+// always visible.
+QIcon refreshGlyphIcon(QWidget *paletteSource) {
+    QIcon icon = UiUtils::icon(QStringLiteral("view-refresh"),
+                               QStringLiteral("view-refresh-symbolic"));
+    if (icon.isNull())
+        icon = UiUtils::icon(QStringLiteral("view-refresh"), QStringLiteral("edit-redo"));
+    if (icon.isNull()) {
+        // DTK keeps DCI icons next to the icon theme; use it when available.
+        const DDciIcon dci = DDciIcon::fromTheme(QStringLiteral("view-refresh"));
+        if (!dci.isNull()) {
+            const qreal dpr = paletteSource ? qMax<qreal>(1.0, paletteSource->devicePixelRatioF()) : 1.0;
+            const QPixmap pm = dci.pixmap(dpr, 24, DDciIcon::Light, DDciIcon::Normal);
+            if (!pm.isNull())
+                icon = QIcon(pm);
+        }
+    }
+    if (!icon.isNull())
+        return icon;
+
+    // Last resort: a palette-aware circular arrow, never a blank button.
+    constexpr int kSide = 24;
+    const qreal dpr = paletteSource ? qMax<qreal>(1.0, paletteSource->devicePixelRatioF()) : 1.0;
+    QPixmap pm(qRound(kSide * dpr), qRound(kSide * dpr));
+    pm.setDevicePixelRatio(dpr);
+    pm.fill(Qt::transparent);
+    QPainter painter(&pm);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const DPalette palette = DPaletteHelper::instance()->palette(paletteSource);
+    const QColor ink = palette.color(DPalette::Text);
+    QPen pen(ink);
+    pen.setWidthF(2.0);
+    pen.setCapStyle(Qt::RoundCap);
+    painter.setPen(pen);
+    painter.drawArc(QRectF(3.5, 3.5, kSide - 7.0, kSide - 7.0), 40 * 16, 285 * 16);
+    QPainterPath head;
+    head.moveTo(kSide - 5.5, 5.0);
+    head.lineTo(kSide - 10.5, 5.5);
+    head.lineTo(kSide - 7.5, 9.5);
+    head.closeSubpath();
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(ink);
+    painter.drawPath(head);
+    painter.end();
+    return QIcon(pm);
+}
+
+// Selectable read-only fingerprint text. The label shrinks its monospace font
+// to the available width so the full 32 characters stay visible instead of
+// being clipped (the profile page can be narrow under the 900px main window).
+class FingerprintLabel : public DTK_WIDGET_NAMESPACE::DLabel {
+public:
+    explicit FingerprintLabel(QWidget *parent) : DLabel(parent) {
+        setTextFormat(Qt::PlainText);
+        setWordWrap(false);
+        setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+        setFocusPolicy(Qt::ClickFocus);
+        setForegroundRole(DPalette::Text);
+        // Ignored horizontal policy lets the layout shrink the row below the
+        // label's natural size; fitToWidth() then picks a readable font size.
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        setMinimumWidth(0);
+    }
+
+    void fitToWidth() {
+        QFont fitted = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        fitted.setStyleHint(QFont::Monospace);
+        fitted.setFixedPitch(true);
+        const int available = qMax(1, contentsRect().width());
+        int pixelSize = 14;
+        for (; pixelSize > 8; --pixelSize) {
+            fitted.setPixelSize(pixelSize);
+            if (QFontMetrics(fitted).horizontalAdvance(text()) + 2 <= available)
+                break;
+        }
+        fitted.setPixelSize(pixelSize);
+        if (font() != fitted)
+            setFont(fitted);
+    }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override {
+        DLabel::resizeEvent(event);
+        fitToWidth();
+    }
+};
+
+// Copy glyph fallback mirroring refreshGlyphIcon(): theme -> DCI -> painted.
+QIcon copyGlyphIcon(QWidget *paletteSource) {
+    QIcon icon = UiUtils::icon(QStringLiteral("edit-copy"),
+                               QStringLiteral("edit-copy-symbolic"));
+    if (icon.isNull())
+        icon = UiUtils::icon(QStringLiteral("edit-copy"), QStringLiteral("copy"));
+    if (icon.isNull()) {
+        const DDciIcon dci = DDciIcon::fromTheme(QStringLiteral("edit-copy"));
+        if (!dci.isNull()) {
+            const qreal dpr = paletteSource ? qMax<qreal>(1.0, paletteSource->devicePixelRatioF()) : 1.0;
+            const QPixmap pm = dci.pixmap(dpr, 20, DDciIcon::Light, DDciIcon::Normal);
+            if (!pm.isNull())
+                icon = QIcon(pm);
+        }
+    }
+    if (!icon.isNull())
+        return icon;
+
+    constexpr int kSide = 20;
+    const qreal dpr = paletteSource ? qMax<qreal>(1.0, paletteSource->devicePixelRatioF()) : 1.0;
+    QPixmap pm(qRound(kSide * dpr), qRound(kSide * dpr));
+    pm.setDevicePixelRatio(dpr);
+    pm.fill(Qt::transparent);
+    QPainter painter(&pm);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const QColor ink = DPaletteHelper::instance()->palette(paletteSource).color(DPalette::Text);
+    QPen pen(ink);
+    pen.setWidthF(1.6);
+    painter.setPen(pen);
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(QRectF(4.0, 3.0, 10.0, 10.0), 2.0, 2.0);
+    painter.drawRoundedRect(QRectF(7.5, 6.5, 9.0, 9.0), 2.0, 2.0);
+    painter.end();
+    return QIcon(pm);
+}
+
+} // namespace
 
 ProfilePage::ProfilePage(Engine *engine, QWidget *parent) : QWidget(parent), m_engine(engine) {
     auto *root = new QVBoxLayout(this);
@@ -102,8 +242,10 @@ ProfilePage::ProfilePage(Engine *engine, QWidget *parent) : QWidget(parent), m_e
     connect(change, &DPushButton::clicked, this, &ProfilePage::chooseAvatar);
     auto *randomAvatar = new DIconButton(card);
     randomAvatar->setObjectName(QStringLiteral("profilePage.randomAvatarButton"));
-    randomAvatar->setIcon(UiUtils::icon(QStringLiteral("view-refresh"),
-                                        QStringLiteral("view-refresh-symbolic")));
+    // A null theme icon used to make this flat button invisible; the helper
+    // always returns a drawable refresh glyph.
+    randomAvatar->setIcon(refreshGlyphIcon(card));
+    randomAvatar->setIconSize(QSize(20, 20));
     randomAvatar->setToolTip(tr("Random avatar"));
     randomAvatar->setAccessibleName(tr("Random avatar"));
     randomAvatar->setFlat(true);
@@ -146,23 +288,30 @@ ProfilePage::ProfilePage(Engine *engine, QWidget *parent) : QWidget(parent), m_e
     auto *fingerprintRow = new QHBoxLayout;
     fingerprintRow->setContentsMargins(0, 0, 0, 0);
     fingerprintRow->setSpacing(8);
-    m_fp = new DLineEdit(card);
-    m_fp->setObjectName(QStringLiteral("profilePage.fingerprint"));
-    m_fp->lineEdit()->setReadOnly(true);
-    m_fp->setClearButtonEnabled(false);
-    m_fp->lineEdit()->setCursorPosition(0);
+    auto *fp = new FingerprintLabel(card);
+    fp->setObjectName(QStringLiteral("profilePage.fingerprint"));
+    fp->setAccessibleName(tr("Account fingerprint"));
+    m_fp = fp;
     auto *copy = new DIconButton(card);
-    copy->setIcon(UiUtils::icon(QStringLiteral("edit-copy")));
+    copy->setObjectName(QStringLiteral("profilePage.copyFingerprintButton"));
+    // Same theme-independence requirement as the random-avatar button.
+    copy->setIcon(copyGlyphIcon(card));
+    copy->setIconSize(QSize(18, 18));
     copy->setToolTip(tr("Copy fingerprint"));
+    copy->setAccessibleName(tr("Copy fingerprint"));
     copy->setFlat(true);
+    copy->setFixedSize(32, 32);
     connect(copy, &DIconButton::clicked, this, [this] {
-        QGuiApplication::clipboard()->setText(m_engine->account()->profile().fingerprint);
+        const QString fingerprint = m_engine->account()->profile().fingerprint;
+        if (fingerprint.isEmpty())
+            return;
+        QGuiApplication::clipboard()->setText(fingerprint);
         DMessageManager::instance()->sendMessage(
             this, UiUtils::icon(QStringLiteral("dialog-ok")),
             tr("Fingerprint copied to the clipboard."));
     });
     fingerprintRow->addWidget(m_fp, 1);
-    fingerprintRow->addWidget(copy);
+    fingerprintRow->addWidget(copy, 0, Qt::AlignVCenter);
     fingerprintBox->addLayout(fingerprintRow);
     cardLayout->addLayout(fingerprintBox);
 
@@ -213,6 +362,11 @@ ProfilePage::ProfilePage(Engine *engine, QWidget *parent) : QWidget(parent), m_e
     load();
 }
 
+void ProfilePage::reload() {
+    refreshAccounts();
+    load();
+}
+
 void ProfilePage::refreshAccounts() {
     if (!m_accountCombo)
         return;
@@ -236,23 +390,89 @@ void ProfilePage::onAccountComboChanged(int index) {
     const auto accounts = m_engine->account()->listAccounts();
     if (index >= accounts.size())
         return;
-    const AccountEntry &entry = accounts.at(index);
+    const AccountEntry entry = accounts.at(index);
     if (entry.id == m_engine->account()->activeRowId())
         return;
     if (!UiUtils::confirm(this, tr("Switch account"),
                           tr("Switch the active identity to “%1”? The network reconnects with "
                              "the new identity and rooms of other accounts stay untouched.")
                               .arg(entry.nickname),
-                          tr("Switch")))
-        return;
-    QString error;
-    if (!m_engine->switchAccount(entry.id, &error)) {
-        UiUtils::warning(this, tr("Switch account"),
-                         error.isEmpty() ? tr("The account switch failed.") : error);
+                          tr("Switch"))) {
         refreshAccounts();
         return;
     }
+    QString error;
+    if (!m_engine->switchAccount(entry.id, &error)) {
+        // Rollback already restored the previous identity; put the combo and
+        // the profile fields back on it before asking the user what to do.
+        refreshAccounts();
+        load();
+        if (m_engine->lastSwitchFailure() == Engine::SwitchFailure::Identity) {
+            offerDestroyUnlockable(entry.id, entry.nickname);
+        } else {
+            UiUtils::warning(this, tr("Switch account"),
+                             error.isEmpty() ? tr("The account switch failed.") : error);
+        }
+        return;
+    }
     load();
+}
+
+void ProfilePage::offerDestroyUnlockable(qint64 accountId, const QString &nickname) {
+    const qint64 activeBefore = m_engine->account()->activeRowId();
+    DDialog dialog(this);
+    dialog.setTitle(tr("Identity cannot be unlocked"));
+    dialog.setMessage(tr("The local keystore of “%1” cannot be decrypted on this device. Its "
+                         "credentials may have changed or the key material may be damaged, so "
+                         "this identity cannot be unlocked here.")
+                          .arg(nickname));
+    dialog.setIcon(UiUtils::icon(QStringLiteral("dialog-warning")));
+    auto *wipe = new QCheckBox(
+        tr("Also delete all chat history, files and download caches"), &dialog);
+    dialog.addContent(wipe);
+    dialog.addButton(tr("Cancel"), true, DDialog::ButtonNormal);
+    dialog.addButton(tr("Destroy account"), false, DDialog::ButtonWarning);
+    connect(&dialog, &DDialog::buttonClicked, this,
+            [this, &dialog, wipe, accountId, nickname, activeBefore](int index, const QString &) {
+                if (index != 1)
+                    return;
+                QString error;
+                const int remaining =
+                    m_engine->destroyAccountById(accountId, wipe->isChecked(), &error);
+                // -1 can still mean "removed, but the remaining count failed":
+                // only report failure when the row is demonstrably still there.
+                bool removed = remaining >= 0;
+                if (!removed) {
+                    removed = true;
+                    for (const AccountEntry &other : m_engine->account()->listAccounts()) {
+                        if (other.id == accountId) {
+                            removed = false;
+                            break;
+                        }
+                    }
+                }
+                if (!removed) {
+                    dialog.setMessage(tr("Destroy failed: %1").arg(error));
+                    return;
+                }
+                dialog.accept();
+                refreshAccounts();
+                load();
+                const bool activeKept =
+                    m_engine->account()->activeRowId() == activeBefore && activeBefore > 0;
+                if (remaining >= 0 && activeKept) {
+                    DMessageManager::instance()->sendMessage(
+                        this, UiUtils::icon(QStringLiteral("dialog-ok")),
+                        tr("The unlockable account “%1” was destroyed.").arg(nickname));
+                } else {
+                    DMessageManager::instance()->sendMessage(
+                        this, UiUtils::icon(QStringLiteral("dialog-warning")),
+                        tr("The unlockable account “%1” was removed, but the active identity or "
+                           "the remaining accounts could not be verified: %2")
+                            .arg(nickname, error));
+                }
+            });
+    dialog.exec();
 }
 
 void ProfilePage::randomAvatar() {
@@ -274,12 +494,14 @@ void ProfilePage::randomAvatar() {
 void ProfilePage::load() {
     const Profile profile = m_engine->account()->profile();
     m_nick->setText(profile.nickname);
-    m_fp->setText(profile.fingerprint);
+    // Never leave the fingerprint row blank: a loaded identity always has the
+    // 32-char value, and the no-account transient state shows a dash.
+    m_fp->setText(profile.fingerprint.isEmpty() ? QStringLiteral("—") : profile.fingerprint);
     m_fp->setToolTip(profile.fingerprint);
+    static_cast<FingerprintLabel *>(m_fp)->fitToWidth();
     m_ip->setText(tr("%1 · port %2")
                       .arg(m_engine->tcpEndpointIp())
                       .arg(m_engine->settings()->tcpPort()));
-    m_fp->lineEdit()->setCursorPosition(0);
     m_ip->setToolTip(m_ip->text());
 
     m_pendingAvatar.clear();
@@ -326,8 +548,8 @@ void ProfilePage::destroyAccount() {
                                "be securely erased; this cannot be undone.\nOther accounts stay "
                                "available and the next one becomes active.")
                           : tr("The private key and account record will be securely erased; this "
-                               "cannot be undone.\nA restart is required afterwards to create a "
-                               "new account."));
+                               "cannot be undone.\nYou will return to the first-start screen to "
+                               "create a new identity."));
     dialog.setIcon(UiUtils::icon(QStringLiteral("dialog-warning")));
     auto *wipe = new QCheckBox(
         tr("Also delete all chat history, files and download caches"), &dialog);
@@ -338,12 +560,13 @@ void ProfilePage::destroyAccount() {
         if (index != 1)
             return;
         QString error;
-        if (m_engine->destroyAccount(wipe->isChecked(), &error) < 0) {
+        const int remaining = m_engine->destroyAccount(wipe->isChecked(), &error);
+        if (remaining < 0) {
             dialog.setMessage(tr("Destroy failed: %1").arg(error));
             return;
         }
         dialog.accept();
-        emit accountDestroyed();
+        emit accountDestroyed(remaining);
     });
     dialog.exec();
 }

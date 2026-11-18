@@ -38,6 +38,9 @@ public:
     void setRoom(const QString &roomId);
     void appendMessage(const Msg &m); // live
     void refreshMuteState();
+    // Inserts "@nickname " at the composer caret and gives it focus (used by
+    // the avatar member menu and by the management dialog's Mention action).
+    void mentionMember(const QString &nickname);
 
 signals:
     void downloadsStarted();                 // MainWindow: jump to transfers page
@@ -58,6 +61,7 @@ private:
     void clearReply();
     bool canRecall(const Msg &message) const;
     void showMessageMenu(const Msg &message, const QPoint &globalPos);
+    void showMemberMenu(const QString &targetFp, const QPoint &globalPos);
     // @-mention composer support: a member picker next to the input plus a
     // live completion popup while typing "@".
     void showMentionPopup(const QString &filter);

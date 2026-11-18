@@ -69,10 +69,13 @@ public:
     static Bytes aesGcmEncrypt(const Bytes &plaintext, const Bytes &kek);
     static std::optional<Bytes> aesGcmDecrypt(const Bytes &blob, const Bytes &kek);
 
-    // Derive a stable device-bound key-encryption-key from a machine factor and
-    // a random per-install salt. This is the documented MVP compromise instead of
-    // kernel keyring/TPM binding (which may be unavailable in a sandbox).
-    static Bytes deriveKek(const Bytes &machineFactor, const Bytes &salt);
+    // Derive a 32-byte key-encryption-key from a secret factor and a random
+    // per-install salt (HKDF-like: SHA256(SHA256(factor || salt) || salt)).
+    // Current keystores pass the per-install random device secret so the KEK no
+    // longer depends on machine-id, hostname, MAC or IP. Legacy keystores used
+    // the machine identity as the factor; the migration path still derives that
+    // old KEK to re-encrypt them (see AccountManager::loadAccount).
+    static Bytes deriveKek(const Bytes &factor, const Bytes &salt);
 
     // Random bytes helper (CSPRNG).
     static Bytes randomBytes(size_t n);
